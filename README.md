@@ -15,6 +15,7 @@ AMTE is a local-first Markdown project editor for focused writing. Its desktop e
 - `Ctrl+O`: open project folder; `Ctrl+S`: save; `Ctrl+P`: source/preview; `Ctrl+T`: toggle theme.
 - `Ctrl++` / `Ctrl+-`: application zoom; `Ctrl+[` / `Ctrl+]`: page width; `Ctrl+Backspace`: reset page width.
 - Plain `F1` focuses the selected (or first) project-tree item, `F2` focuses CodeMirror without changing its caret or selection, and `F3` focuses the current (or first) outline chapter. Tree rows support arrows, Enter, and Space for navigation and expansion.
+- Plain `F5` opens Find in document. Type a literal, case-insensitive search term and press Enter to apply it, close the dialog, and select the first result at or after the caret (wrapping to the start). `Esc` or `F5` closes Find without clearing its active term. Plain `F6` selects the previous result and `F7` selects the next result; both wrap and switch from preview to source only when a result exists. Empty Enter clears the active search. Search never leaves the active Markdown source document.
 
 The three-column layout keeps the page centered in its middle workspace and provides physical page-edge resize handles. Tree, editor/preview, and outline have independent scrolling. Markdown preview, H1–H5 outline navigation, word totals with a daily baseline, incremental worker analysis, and five-minute autosave are included.
 
@@ -37,6 +38,7 @@ npm ci
 npm run dev
 npm run lint
 npm test
+npm run search:browser
 npm run build
 npm run benchmark
 

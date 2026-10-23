@@ -4,6 +4,8 @@ import test from 'node:test';
 import { applyChanges, extractHeadings, wordCount } from './analysis.js';
 import { AnalysisEngine } from './analysis-worker.js';
 import { DEFAULT_THEME_ID, applyTheme, chooseTheme, isThemeToggleShortcut, validateTheme } from './theme-selection.js';
+import { SearchQuery } from '@codemirror/search';
+import { EditorState } from '@codemirror/state';
 
 const root = new URL('..', import.meta.url);
 const read = (path) => readFileSync(new URL(path, root), 'utf8');
@@ -55,6 +57,24 @@ test('plain F1/F2/F3 focus routing prevents defaults and preserves existing Ctrl
   assert.match(source, /else if \(event\.key === 'F2'\).*view\.focus\(\)/s);
   for (const command of ['key === \'p\'', 'key === \'s\'', 'key === \'o\'', 'BracketLeft', 'BracketRight', 'NumpadAdd']) assert.match(source, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.equal(isThemeToggleShortcut({ ctrlKey: true, altKey: false, metaKey: false, key: 't' }), true);
+});
+
+test('active-document search uses CodeMirror literal queries, native commands, modal focus handling, and reset wiring', () => {
+  const state = EditorState.create({ doc: 'Alpha [a] alpha' });
+  const query = new SearchQuery({ search: '[a]', caseSensitive: false, literal: true, regexp: false });
+  const matches = [...query.getCursor(state)].map(({ from, to }) => [from, to]);
+  assert.deepEqual(matches, [[6, 9]]);
+  assert.equal(new SearchQuery({ search: '', literal: true }).valid, false);
+  assert.match(source, /import \{ SearchQuery, closeSearchPanel, findNext, findPrevious, openSearchPanel, search, setSearchQuery \} from '@codemirror\/search'/);
+  assert.match(source, /search\(\{ createPanel: createSearchDecorationPanel \}\)/);
+  assert.match(source, /new SearchQuery\(\{ search: term, caseSensitive: false, literal: true, regexp: false \}\)/);
+  assert.match(source, /navigateSearch\(event\.key === 'F6' \? findPrevious : findNext\)/);
+  assert.match(source, /clearSearchState\(\{ closeDialog: true \}\);[\s\S]*?view\.setState\(createState\(document\)\)/);
+  assert.match(source, /searchDialog\.addEventListener\('cancel'/);
+  assert.match(source, /event\.key !== 'Tab'/);
+  assert.match(html, /id="search-dialog"[^>]*aria-modal="true"[^>]*aria-labelledby="search-dialog-title"/);
+  assert.match(html, /<label for="search-term">Search term<\/label>/);
+  assert.match(styles, /\.cm-searchMatch\.cm-searchMatch-selected/);
 });
 
 test('chapter keyboard navigation keeps a selected card and reuses exact chapter navigation', () => {

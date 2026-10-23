@@ -71,6 +71,18 @@
         <div><button value="save">Save</button><button value="discard">Discard</button><button value="cancel">Cancel</button></div>
       </form>
     </dialog>
+    <dialog id="search-dialog" class="search-dialog" aria-modal="true" aria-labelledby="search-dialog-title" aria-describedby="search-status">
+      <form id="search-form" novalidate>
+        <h2 id="search-dialog-title">Find in document</h2>
+        <label for="search-term">Search term</label>
+        <input id="search-term" name="search-term" type="text" autocomplete="off" spellcheck="false" />
+        <div class="search-dialog__actions">
+          <button type="submit">Search</button>
+          <button id="search-close" type="button">Close</button>
+        </div>
+      </form>
+    </dialog>
+    <p id="search-status" class="visually-hidden" role="status" aria-live="polite"></p>
     <script type="module" src="./app.js"></script>
   </body>
 </html>

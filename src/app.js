@@ -3,6 +3,7 @@ import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirro
 import { markdown } from '@codemirror/lang-markdown';
 import { syntaxHighlighting, HighlightStyle } from '@codemirror/language';
 import { EditorView, keymap } from '@codemirror/view';
+import { SearchQuery, closeSearchPanel, findNext, findPrevious, openSearchPanel, search, setSearchQuery } from '@codemirror/search';
 import { tags } from '@lezer/highlight';
 import themeUrl from './theme.json?url';
 import vintageThemeUrl from './themes/vintage-msdos-edit.json?url';
@@ -122,6 +123,8 @@ function editorTheme() {
       '.cm-gutters': { display: 'none' },
       '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--theme-caret)' },
       '.cm-selectionBackground, ::selection': { backgroundColor: 'var(--theme-selection) !important' },
+      '.cm-searchMatch': { backgroundColor: 'color-mix(in srgb, var(--theme-accent) 42%, transparent)', outline: '1px solid color-mix(in srgb, var(--theme-accent) 68%, transparent)' },
+      '.cm-searchMatch.cm-searchMatch-selected': { backgroundColor: 'var(--theme-accent)', color: 'var(--theme-paper)', outlineColor: 'var(--theme-ink)' },
       '.cm-focused': { outline: 'none' },
     }),
     syntaxHighlighting(HighlightStyle.define([
@@ -170,6 +173,11 @@ async function start() {
   const projectPanel = document.querySelector('.project-panel');
   const projectTree = document.querySelector('#project-tree');
   const dirtyDialog = document.querySelector('#dirty-dialog');
+  const searchDialog = document.querySelector('#search-dialog');
+  const searchForm = document.querySelector('#search-form');
+  const searchInput = document.querySelector('#search-term');
+  const searchClose = document.querySelector('#search-close');
+  const searchStatus = document.querySelector('#search-status');
   const projectPathLabel = document.querySelector('#project-path');
   const documentShell = document.querySelector('#document-shell');
   const themeChrome = document.querySelector('#theme-chrome');
@@ -212,6 +220,10 @@ async function start() {
   const benchmarkMode = new URLSearchParams(window.location.search).has('benchmark');
   const updateSamples = [];
   let view;
+  let activeSearchTerm = '';
+  let searchRestoreTarget = null;
+  let searchShouldRestoreFocus = false;
+  let searchRestoreToEditor = false;
 
   function refreshBoxFrames() {
     if (root.dataset.theme !== 'vintage-msdos-edit') return;
@@ -453,6 +465,142 @@ async function start() {
     else view.focus();
   }
 
+  function createSearchDecorationPanel() {
+    const panel = document.createElement('div');
+    panel.className = 'search-decoration-panel';
+    panel.setAttribute('aria-hidden', 'true');
+    return { dom: panel };
+  }
+
+  function isVisibleFocusTarget(target) {
+    return target instanceof HTMLElement
+      && target !== document.body
+      && target.isConnected
+      && !target.closest('[hidden]')
+      && target.getClientRects().length > 0;
+  }
+
+  function restoreSearchFocus() {
+    const restoreTarget = searchRestoreTarget;
+    const focusEditor = searchRestoreToEditor;
+    const shouldRestore = searchShouldRestoreFocus;
+    searchRestoreTarget = null;
+    searchRestoreToEditor = false;
+    searchShouldRestoreFocus = false;
+    if (!shouldRestore) return;
+    if (focusEditor) {
+      if (previewing) togglePreview();
+      view.focus();
+    } else if (isVisibleFocusTarget(restoreTarget)) {
+      restoreTarget.focus({ preventScroll: true });
+    } else if (previewing) {
+      preview.tabIndex = -1;
+      preview.focus({ preventScroll: true });
+    } else {
+      view.focus();
+    }
+  }
+
+  function closeSearchDialog({ restoreFocus = true, focusEditor = false } = {}) {
+    if (!searchDialog.open) return;
+    searchShouldRestoreFocus = restoreFocus;
+    searchRestoreToEditor = focusEditor;
+    searchDialog.close();
+  }
+
+  function openSearchDialog() {
+    if (searchDialog.open || dirtyDialog.open) return;
+    searchRestoreTarget = document.activeElement;
+    searchShouldRestoreFocus = true;
+    searchRestoreToEditor = false;
+    searchInput.value = activeSearchTerm;
+    searchStatus.textContent = '';
+    searchDialog.showModal();
+    searchInput.focus();
+    searchInput.select();
+  }
+
+  function clearSearchState({ closeDialog = false } = {}) {
+    activeSearchTerm = '';
+    searchInput.value = '';
+    searchStatus.textContent = '';
+    if (view) {
+      view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: '', caseSensitive: false, literal: true })) });
+      closeSearchPanel(view);
+    }
+    if (closeDialog) closeSearchDialog({ restoreFocus: false });
+  }
+
+  function setActiveSearch(term) {
+    activeSearchTerm = term;
+    // The official highlighter is enabled by an open search panel. This panel
+    // is deliberately empty—the accessible application dialog owns the UI.
+    openSearchPanel(view);
+    view.dispatch({
+      effects: setSearchQuery.of(new SearchQuery({ search: term, caseSensitive: false, literal: true, regexp: false })),
+    });
+  }
+
+  function navigateSearch(command) {
+    if (!activeSearchTerm) return false;
+    // Commands provide native query matching, wrapping, selection, and match
+    // announcements. Run before leaving preview so a no-match key is harmless.
+    if (!command(view)) return false;
+    if (previewing) {
+      togglePreview();
+      view.dispatch({ effects: EditorView.scrollIntoView(view.state.selection.main, { y: 'center' }) });
+    } else {
+      view.focus();
+    }
+    return true;
+  }
+
+  function submitSearch() {
+    const term = searchInput.value;
+    if (!term) {
+      clearSearchState();
+      closeSearchDialog();
+      return;
+    }
+    setActiveSearch(term);
+    // Enter always returns to source editing. It selects the first native
+    // result at/after the caret (wrapping), or leaves the document untouched.
+    if (previewing) togglePreview();
+    if (!findNext(view)) searchStatus.textContent = 'No matches in this document.';
+    else searchStatus.textContent = '';
+    closeSearchDialog({ focusEditor: true });
+  }
+
+  function focusableSearchControls() {
+    return [...searchDialog.querySelectorAll('button:not([disabled]), input:not([disabled])')]
+      .filter((element) => isVisibleFocusTarget(element));
+  }
+
+  searchDialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    closeSearchDialog();
+  });
+  searchDialog.addEventListener('close', restoreSearchFocus);
+  searchForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    submitSearch();
+  });
+  searchClose.addEventListener('click', () => closeSearchDialog());
+  searchDialog.addEventListener('keydown', (event) => {
+    if (event.key !== 'Tab') return;
+    const controls = focusableSearchControls();
+    if (!controls.length) return;
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+
   function sendInitialAnalysis(document) {
     sourceVersion += 1;
     analysisVersion = -1;
@@ -478,6 +626,7 @@ async function start() {
         history(),
         keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
         markdown(),
+        search({ createPanel: createSearchDecorationPanel }),
         EditorView.lineWrapping,
         editorTheme(),
         EditorView.updateListener.of(handleUpdate),
@@ -501,6 +650,7 @@ async function start() {
   };
 
   function setProject(project) {
+    clearSearchState({ closeDialog: true });
     currentProject = project;
     currentRelativePath = null;
     currentPath = null;
@@ -514,6 +664,7 @@ async function start() {
   }
 
   function replaceDocument(document, { relativePath = null, documentId = null, writeRevision = 0, clean = false } = {}) {
+    clearSearchState({ closeDialog: true });
     documentGeneration += 1;
     contentVersion += 1;
     currentRelativePath = relativePath;
@@ -752,6 +903,27 @@ async function start() {
   window.addEventListener('pointercancel', stopPageResize);
   window.addEventListener('resize', applyPageWidth);
   window.addEventListener('keydown', (event) => {
+    const plainFunctionKey = !event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey;
+    if (searchDialog.open) {
+      if (plainFunctionKey && (event.key === 'F5' || event.key === 'Escape')) {
+        event.preventDefault();
+        closeSearchDialog();
+      } else if (plainFunctionKey && /^F[1-7]$/.test(event.key)) {
+        event.preventDefault();
+      }
+      return;
+    }
+    if (dirtyDialog.open) return;
+    if (plainFunctionKey && event.key === 'F5') {
+      event.preventDefault();
+      openSearchDialog();
+      return;
+    }
+    if (plainFunctionKey && (event.key === 'F6' || event.key === 'F7')) {
+      event.preventDefault();
+      navigateSearch(event.key === 'F6' ? findPrevious : findNext);
+      return;
+    }
     if (!event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && ['F1', 'F2', 'F3'].includes(event.key)) {
       event.preventDefault();
       if (event.key === 'F1') focusTree();

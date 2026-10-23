@@ -8,12 +8,14 @@
     "build": "vite --config vite.config.js build",
     "test": "node --test src/app.test.js",
     "lint": "node --check src/app.js && node --check src/theme-selection.js && node --check src/analysis.js && node --check src/analysis-worker.js && node --check src/app.benchmark.js",
-    "benchmark": "node src/app.benchmark.js"
+    "benchmark": "node src/app.benchmark.js",
+    "search:browser": "npm run build && node src/app.benchmark.js --search-check"
   },
   "dependencies": {
     "@codemirror/commands": "6.11.1",
     "@codemirror/lang-markdown": "6.5.2",
     "@codemirror/language": "6.13.1",
+    "@codemirror/search": "6.7.2",
     "@codemirror/state": "6.7.6",
     "@codemirror/view": "6.43.14",
     "@lezer/highlight": "1.2.5"
