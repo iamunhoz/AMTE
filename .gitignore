@@ -1,0 +1,29 @@
+# JavaScript dependencies and generated frontend output
+/node_modules/
+/dist/
+
+# Rust build output
+/target/
+/src-tauri/target/
+
+# Local state, caches, temporary files, and logs
+.cache/
+.vite/
+.turbo/
+.eslintcache
+coverage/
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+.DS_Store
+
+# Local environment files and secret material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx

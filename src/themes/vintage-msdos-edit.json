@@ -1,0 +1,43 @@
+{
+  "metadata": {
+    "id": "vintage-msdos-edit",
+    "name": "Vintage MS-DOS Edit",
+    "variant": "dark",
+    "inspiration": "An original, DOS-editor-inspired treatment using a saturated blue screen, gray information bars, box-drawing glyphs, and an original CSS stipple tile. No screenshot pixels or external runtime assets are used.",
+    "font": "VT323 Regular, distributed unchanged under SIL Open Font License 1.1; see src/assets/fonts/OFL.txt."
+  },
+  "colors": {
+    "workspace": { "value": "#1b3159", "origin": "derived", "basis": "Original blue-gray backdrop for the CSS stipple tile." },
+    "textureLight": { "value": "#38517d", "origin": "derived", "basis": "Original stipple tile light square." },
+    "textureDark": { "value": "#243f6d", "origin": "derived", "basis": "Original stipple tile dark square." },
+    "dosBlue": { "value": "#001f9f", "origin": "derived", "basis": "Original saturated DOS-blue writing and outline surface." },
+    "white": { "value": "#ffffff", "origin": "derived", "basis": "High-contrast foreground and box edge." },
+    "grayBar": { "value": "#a9a9a9", "origin": "derived", "basis": "Neutral informational chrome." },
+    "grayBarInk": { "value": "#101010", "origin": "derived", "basis": "Readable gray-bar text." },
+    "selection": { "value": "#777777", "origin": "derived", "basis": "DOS-like inversion/selection gray." },
+    "focus": { "value": "#ffff55", "origin": "derived", "basis": "Restrained high-visibility focus and link accent." },
+    "mutedWhite": { "value": "#dedede", "origin": "derived", "basis": "Secondary white text while retaining contrast on blue." },
+    "codeBlue": { "value": "#001a80", "origin": "derived", "basis": "Subtle code inset on the primary blue surface." },
+    "shadow": { "value": "#000000", "origin": "derived", "basis": "Hard offset drop shadow." },
+    "scrollbar": { "value": "#c8c8c8", "origin": "derived", "basis": "High-contrast internal scrollbar thumb." },
+    "scrollbarHover": { "value": "#ffffff", "origin": "derived", "basis": "Scrollbar hover state." },
+    "scrollbarActive": { "value": "#ffff55", "origin": "derived", "basis": "Scrollbar active state." },
+    "strike": { "value": "#bdbdbd", "origin": "derived", "basis": "Legible restrained syntax accent." }
+  },
+  "roles": {
+    "css": {
+      "workspace": "workspace", "paper": "dosBlue", "card": "dosBlue", "ink": "white", "secondary": "white", "muted": "mutedWhite", "border": "white", "subtleBorder": "white", "selection": "selection", "hover": "selection", "caret": "white", "accent": "focus", "activeCard": "selection", "inactiveSelection": "selection", "link": "focus", "scrollbar": "scrollbar", "scrollbarHover": "scrollbarHover", "scrollbarActive": "scrollbarActive", "codeSurface": "codeBlue", "code": "white", "blockquote": "dosBlue", "pageEdge": "white", "pageShadow": "shadow", "pageShadowSoft": "shadow"
+    },
+    "syntax": {
+      "headingMarker": "white", "h1": "white", "h2": "white", "h3": "white", "h4": "white", "h5": "white", "h6": "white", "marker": "white", "emphasis": "white", "link": "focus", "code": "white", "blockquote": "white", "list": "white", "strikethrough": "strike"
+    }
+  },
+  "presentation": {
+    "typography": { "fontFamily": "VT323, \"Courier New\", monospace", "fontSize": "1.25rem", "lineHeight": "1.35" },
+    "texture": { "tileSize": "4px", "light": "textureLight", "dark": "textureDark" },
+    "box": { "horizontal": "═", "vertical": "║", "topLeft": "\"╔\"", "topRight": "\"╗\"", "bottomLeft": "\"╚\"", "bottomRight": "\"╝\"" },
+    "shadow": { "offset": "10px", "color": "shadow" },
+    "bar": { "background": "grayBar", "foreground": "grayBarInk" },
+    "layout": { "topBarHeight": "1.45rem" }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "metadata": {
+    "name": "AMTE Monokai +Orange",
+    "variant": "dark",
+    "sourceUrl": "https://raw.githubusercontent.com/tw-studio/monokai-accent/refs/heads/main/themes/Monokai%2BOrange-theme.json",
+    "upstreamTheme": "Monokai +Orange",
+    "attribution": "Copyright 2023–present tw. Upstream theme licensed MIT."
+  },
+  "colors": {
+    "workspace": { "value": "#2a2a2a", "origin": "upstream", "source": "sideBar.background, panel.background, editorPane.background" },
+    "editorSurface": { "value": "#242424", "origin": "upstream", "source": "editor.background" },
+    "elevatedSurface": { "value": "#1f1f1f", "origin": "upstream", "source": "input.background, dropdown.background" },
+    "primaryText": { "value": "#f6f6f6", "origin": "upstream", "source": "editor.foreground" },
+    "secondaryText": { "value": "#cccccc", "origin": "upstream", "source": "foreground" },
+    "mutedText": { "value": "#666666", "origin": "upstream", "source": "editorLineNumber.foreground" },
+    "border": { "value": "#444444", "origin": "upstream", "source": "input.border" },
+    "subtleBorder": { "value": "#242424", "origin": "upstream", "source": "sideBar.border" },
+    "selection": { "value": "#404040", "origin": "upstream", "source": "editor.selectionBackground" },
+    "orangeOverlay": { "value": "#c6601a33", "origin": "upstream", "source": "editor.selectionHighlightBackground, list.hoverBackground" },
+    "caret": { "value": "#b6b6b6", "origin": "upstream", "source": "editorCursor.foreground" },
+    "accent": { "value": "#c6601a", "origin": "upstream", "source": "focusBorder, button.background" },
+    "activeCard": { "value": "#c6601add", "origin": "upstream", "source": "list.activeSelectionBackground" },
+    "inactiveSelection": { "value": "#cccccc22", "origin": "upstream", "source": "list.inactiveSelectionBackground" },
+    "link": { "value": "#f5822e", "origin": "upstream", "source": "textLink.foreground" },
+    "scrollbar": { "value": "#66666680", "origin": "upstream", "source": "scrollbarSlider.background" },
+    "scrollbarHover": { "value": "#75757580", "origin": "upstream", "source": "scrollbarSlider.hoverBackground" },
+    "scrollbarActive": { "value": "#91919180", "origin": "upstream", "source": "scrollbarSlider.activeBackground" },
+    "codeSurface": { "value": "#303030", "origin": "upstream", "source": "Markdown fenced code block background" },
+    "code": { "value": "#ffee99", "origin": "upstream", "source": "Markdown inline/fenced code, string" },
+    "blockquote": { "value": "#2a2a2a", "origin": "upstream", "source": "Markdown blockquote background" },
+    "h1": { "value": "#5faa86", "origin": "upstream", "source": "Markdown heading 1" },
+    "h2": { "value": "#7bd88f", "origin": "upstream", "source": "Markdown heading 2" },
+    "h3": { "value": "#78e6d0", "origin": "upstream", "source": "Markdown heading 3" },
+    "h4": { "value": "#66d6ed", "origin": "upstream", "source": "Markdown heading 4" },
+    "h5": { "value": "#02BDD3", "origin": "upstream", "source": "Markdown heading 5" },
+    "h6": { "value": "#0294a5", "origin": "upstream", "source": "Markdown heading 6" },
+    "headingMarker": { "value": "#c1e4d3", "origin": "upstream", "source": "Markdown heading marker" },
+    "marker": { "value": "#ff80f4", "origin": "upstream", "source": "Markdown general/list markers, separators, number" },
+    "emphasis": { "value": "#fd971f", "origin": "upstream", "source": "Markdown emphasis, strong, blockquote" },
+    "markdownLink": { "value": "#75c0fc", "origin": "upstream", "source": "Markdown link text/URL" },
+    "strikethrough": { "value": "#636363", "origin": "upstream", "source": "Markdown strikethrough" },
+    "pageEdge": { "value": "#444444", "origin": "derived", "basis": "Uses the upstream input border to define the A4 page edge." },
+    "pageShadow": { "value": "#00000059", "origin": "derived", "basis": "Neutral black shadow at the existing A4 elevation opacity." },
+    "pageShadowSoft": { "value": "#0000003d", "origin": "derived", "basis": "Neutral black shadow at the existing A4 contact-shadow opacity." }
+  },
+  "roles": {
+    "css": {
+      "workspace": "workspace", "paper": "editorSurface", "card": "elevatedSurface", "ink": "primaryText", "secondary": "secondaryText", "muted": "mutedText", "border": "border", "subtleBorder": "subtleBorder", "selection": "selection", "hover": "orangeOverlay", "caret": "caret", "accent": "accent", "activeCard": "activeCard", "inactiveSelection": "inactiveSelection", "link": "link", "scrollbar": "scrollbar", "scrollbarHover": "scrollbarHover", "scrollbarActive": "scrollbarActive", "codeSurface": "codeSurface", "code": "code", "blockquote": "blockquote", "pageEdge": "pageEdge", "pageShadow": "pageShadow", "pageShadowSoft": "pageShadowSoft"
+    },
+    "syntax": { "headingMarker": "headingMarker", "h1": "h1", "h2": "h2", "h3": "h3", "h4": "h4", "h5": "h5", "h6": "h6", "marker": "marker", "emphasis": "emphasis", "link": "markdownLink", "code": "code", "blockquote": "emphasis", "list": "primaryText", "strikethrough": "strikethrough" }
+  }
+}

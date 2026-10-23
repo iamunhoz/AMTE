@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>amte</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="theme-loading">
+    <p id="theme-error" class="theme-error" role="alert" hidden></p>
+    <main class="workspace" aria-label="amte editor workspace">
+      <div class="workspace-content">
+        <div id="theme-chrome" class="theme-chrome" aria-label="Opened project">
+          <span id="project-path" class="project-path" title="No project open">No project open</span>
+        </div>
+        <div class="writing-layout">
+          <aside class="project-panel" aria-label="Project files">
+            <div class="project-panel__title">PROJECT</div>
+            <div id="project-tree" class="project-tree" role="tree" aria-label="Project Markdown files"></div>
+          </aside>
+          <section class="editor-workspace" aria-label="Writing workspace">
+          <div class="paper" aria-label="Writing page">
+            <div class="document-shell" id="document-shell">
+              <div
+                id="editor"
+                aria-label="Markdown document"
+                aria-describedby="document-metrics"
+              ></div>
+              <article id="preview" class="preview" aria-label="Rendered Markdown preview" hidden></article>
+            </div>
+            <span class="box-frame" aria-hidden="true">
+              <span class="box-frame__edge box-frame__edge--top" data-box-edge="top"></span>
+              <span class="box-frame__edge box-frame__edge--right" data-box-edge="right"></span>
+              <span class="box-frame__edge box-frame__edge--bottom" data-box-edge="bottom"></span>
+              <span class="box-frame__edge box-frame__edge--left" data-box-edge="left"></span>
+              <span class="box-frame__corner box-frame__corner--top-left" data-box-corner="top-left"></span>
+              <span class="box-frame__corner box-frame__corner--top-right" data-box-corner="top-right"></span>
+              <span class="box-frame__corner box-frame__corner--bottom-right" data-box-corner="bottom-right"></span>
+              <span class="box-frame__corner box-frame__corner--bottom-left" data-box-corner="bottom-left"></span>
+            </span>
+            <div
+              id="page-resize-handle-left"
+              class="page-resize-handle page-resize-handle-left"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize writing page from the left edge"
+            ></div>
+            <div
+              id="page-resize-handle-right"
+              class="page-resize-handle page-resize-handle-right"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize writing page from the right edge"
+            ></div>
+          </div>
+          </section>
+          <nav class="chapter-sidebar" aria-label="Chapters">
+            <div id="chapter-list" class="chapter-list"></div>
+          </nav>
+        </div>
+        <p id="document-metrics" class="document-metrics" aria-label="Document word counts">
+          <span id="total-count">total: 0</span>
+          <span id="daily-count">0/250</span>
+        </p>
+      </div>
+    </main>
+    <dialog id="dirty-dialog" class="dirty-dialog" aria-labelledby="dirty-dialog-title">
+      <form method="dialog">
+        <p id="dirty-dialog-title">Save changes before switching?</p>
+        <div><button value="save">Save</button><button value="discard">Discard</button><button value="cancel">Cancel</button></div>
+      </form>
+    </dialog>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
