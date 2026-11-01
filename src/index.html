@@ -56,19 +56,25 @@
           </div>
           </section>
           <nav class="chapter-sidebar" aria-label="Chapters">
-            <div id="chapter-list" class="chapter-list"></div>
+            <div id="chapter-list" class="chapter-list" role="tree" aria-label="Document headings"></div>
           </nav>
         </div>
         <p id="document-metrics" class="document-metrics" aria-label="Document word counts">
           <span id="total-count">total: 0</span>
-          <span id="daily-count">0/250</span>
+          <span id="daily-count">(-): 0 (+): 0</span>
+          <span id="save-indicator" class="save-indicator" role="status" aria-live="polite" aria-atomic="true" aria-label="Documento salvo" hidden>
+            <svg class="save-indicator__icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+              <path fill="currentColor" d="M2 1h9l3 3v11H2V1Zm2 2v4h7V3H4Zm1 7v3h6v-3H5Zm7-5.5a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" />
+            </svg>
+            <span class="visually-hidden">Documento salvo</span>
+          </span>
         </p>
       </div>
     </main>
     <dialog id="dirty-dialog" class="dirty-dialog" aria-labelledby="dirty-dialog-title">
       <form method="dialog">
-        <p id="dirty-dialog-title">Save changes before switching?</p>
-        <div><button value="save">Save</button><button value="discard">Discard</button><button value="cancel">Cancel</button></div>
+        <p id="dirty-dialog-title">Save all changed buffers?</p>
+        <div><button value="save">Save All</button><button value="discard">Discard All</button><button value="cancel">Cancel</button></div>
       </form>
     </dialog>
     <dialog id="search-dialog" class="search-dialog" aria-modal="true" aria-labelledby="search-dialog-title" aria-describedby="search-status">

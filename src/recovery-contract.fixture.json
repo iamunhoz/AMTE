@@ -1,0 +1,26 @@
+{
+  "relativePath": "chapter.md",
+  "documentId": 42,
+  "writeRevision": 4,
+  "recoverySequence": 11,
+  "utf16PositionFixture": {
+    "text": "Olá 😀é",
+    "length": 8,
+    "oversizedSelection": { "anchor": 999, "head": 9 }
+  },
+  "dirty": false,
+  "content": null,
+  "payload": null,
+  "payloadHash": null,
+  "payloadBytes": null,
+  "baselineHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sourceScroll": { "top": 12, "left": 0 },
+  "selection": { "anchor": 999, "head": 999 },
+  "previewScroll": 4,
+  "previewing": false,
+  "searchTerm": "term",
+  "chapterIdentity": "chapter",
+  "chapterScroll": 5,
+  "collapsedChapterIdentities": null,
+  "activity": { "day": "2026-10-25", "added": 2, "deleted": 1 }
+}

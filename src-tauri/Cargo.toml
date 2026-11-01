@@ -17,6 +17,8 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 ammonia = "4"
+blake3 = "1"
+libc = "0.2"
 gpui = "0.2.2"
 pulldown-cmark = "0.13"
 serde = { version = "1", features = ["derive"] }

@@ -3,10 +3,16 @@ import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirro
 import { markdown } from '@codemirror/lang-markdown';
 import { syntaxHighlighting, HighlightStyle } from '@codemirror/language';
 import { EditorView, keymap } from '@codemirror/view';
+import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { SearchQuery, closeSearchPanel, findNext, findPrevious, openSearchPanel, search, setSearchQuery } from '@codemirror/search';
 import { tags } from '@lezer/highlight';
+import appConfigUrl from './config.json?url';
 import themeUrl from './theme.json?url';
 import vintageThemeUrl from './themes/vintage-msdos-edit.json?url';
+import { classifyWordActivity, reconcileCollapsedChapterIdentities } from './analysis.js';
+import { BufferSession, clampRestoredSelection } from './buffer-session.js';
+import { createCloseRequestGuard, runCloseFlow } from './close-flow.js';
+import { createSaveIndicatorController } from './save-indicator.js';
 import {
   DEFAULT_THEME_ID,
   applyTheme,
@@ -35,6 +41,58 @@ const WORKSPACE_BREATHING_GAP_MAX = 32;
 const WORKSPACE_BREATHING_GAP_RATIO = 0.02;
 const METRICS_HEIGHT = 20;
 const AUTOSAVE_INTERVAL_MS = 300000;
+const AUTO_CLOSE_BRACKETS = Object.freeze(['(', '[', '{', '"', "'", '`']);
+
+/* APP_CONFIG_START */
+const DEFAULT_APP_CONFIG = Object.freeze({
+  appearance: Object.freeze({ vintageAsciiFrames: false }),
+  editor: Object.freeze({ autoClosePairs: true }),
+});
+
+function validateAppConfig(value) {
+  const vintageAsciiFrames = value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && value.appearance
+    && typeof value.appearance === 'object'
+    && !Array.isArray(value.appearance)
+    && typeof value.appearance.vintageAsciiFrames === 'boolean'
+    ? value.appearance.vintageAsciiFrames
+    : false;
+  const autoClosePairs = value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && value.editor
+    && typeof value.editor === 'object'
+    && !Array.isArray(value.editor)
+    && typeof value.editor.autoClosePairs === 'boolean'
+    ? value.editor.autoClosePairs
+    : true;
+  return { appearance: { vintageAsciiFrames }, editor: { autoClosePairs } };
+}
+
+async function loadAppConfig(url, fetchFn = fetch) {
+  try {
+    const response = await fetchFn(url);
+    if (!response?.ok) return DEFAULT_APP_CONFIG;
+    return validateAppConfig(await response.json());
+  } catch {
+    return DEFAULT_APP_CONFIG;
+  }
+}
+
+function applyAppConfig(config, root = document.documentElement) {
+  root.dataset.vintageAsciiFrames = String(validateAppConfig(config).appearance.vintageAsciiFrames);
+}
+
+function paintsVintageAsciiFrames(root = document.documentElement) {
+  return root.dataset.theme === 'vintage-msdos-edit' && root.dataset.vintageAsciiFrames === 'true';
+}
+
+function clearBoxFramePaint(frame) {
+  for (const part of frame.querySelectorAll('[data-box-edge], [data-box-corner]')) part.textContent = '';
+}
+/* APP_CONFIG_END */
 
 // This small controller deliberately has no editor or worker dependencies: an
 // autosave always receives the synchronous CodeMirror snapshot taken at tick
@@ -43,20 +101,28 @@ const AUTOSAVE_INTERVAL_MS = 300000;
 function createAutosaveController({ snapshot, write, onSuccess, onError, setIntervalFn, clearIntervalFn }) {
   let timer = null;
   let writeInFlight = false;
+  let work = null;
+  let paused = false;
 
   async function tick() {
-    if (writeInFlight) return;
+    if (paused || writeInFlight) return;
     const pending = snapshot();
-    if (!pending) return;
+    if (!pending || (Array.isArray(pending) && !pending.length)) return;
     writeInFlight = true;
-    try {
-      await write(pending);
-      onSuccess(pending);
-    } catch (error) {
-      onError(error);
-    } finally {
-      writeInFlight = false;
-    }
+    work = (async () => {
+      try {
+      if (Array.isArray(pending)) {
+        for (const item of pending) {
+          try { onSuccess(item, await write(item)); } catch (error) { onError(error, item); }
+        }
+      } else onSuccess(pending, await write(pending));
+      } catch (error) {
+        onError(error);
+      } finally {
+        writeInFlight = false;
+      }
+    })();
+    try { await work; } finally { work = null; }
   }
 
   return {
@@ -69,6 +135,8 @@ function createAutosaveController({ snapshot, write, onSuccess, onError, setInte
       clearIntervalFn(timer);
       timer = null;
     },
+    async quiesce() { paused = true; this.stop(); if (work) await work; },
+    resume() { paused = false; this.start(); },
     tick,
     get writing() { return writeInFlight; },
   };
@@ -105,6 +173,80 @@ function localDay() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }
+
+/* DAILY_WORD_ACTIVITY_START */
+const DAILY_WORD_ACTIVITY_PREFIX = 'amte.daily-word-activity.v1:';
+
+function validActivityCount(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function addActivityCounts(left, right) {
+  return Math.min(Number.MAX_SAFE_INTEGER, left + right);
+}
+
+function readDailyWordActivity(storage, key, day) {
+  try {
+    const value = JSON.parse(storage.getItem(`${DAILY_WORD_ACTIVITY_PREFIX}${key}`));
+    if (value?.day === day && validActivityCount(value.added) && validActivityCount(value.deleted)) return value;
+  } catch { /* Treat unavailable or malformed local storage as an empty day. */ }
+  return { day, added: 0, deleted: 0 };
+}
+
+function createDailyWordActivityStore({ storage, getDay }) {
+  let identity = null;
+  let activity = { day: getDay(), added: 0, deleted: 0 };
+  const blank = (day = getDay()) => ({ day, added: 0, deleted: 0 });
+  const persist = () => {
+    if (!identity) return;
+    try { storage.setItem(`${DAILY_WORD_ACTIVITY_PREFIX}${identity}`, JSON.stringify(activity)); } catch (error) { console.error('Could not persist daily word activity:', error); }
+  };
+  const rollOver = () => {
+    const day = getDay();
+    if (activity.day === day) return;
+    activity = blank(day);
+    persist();
+  };
+  return {
+    setIdentity(nextIdentity) {
+      const next = nextIdentity || null;
+      if (next === identity) { rollOver(); return this.snapshot(); }
+      identity = next;
+      activity = identity ? readDailyWordActivity(storage, identity, getDay()) : blank();
+      return this.snapshot();
+    },
+    // A successful first Save As gives transient activity a durable file key.
+    // Existing activity for that path (if any) is retained and combined.
+    adoptIdentity(nextIdentity) {
+      if (!nextIdentity) return this.snapshot();
+      rollOver();
+      if (identity) return this.setIdentity(nextIdentity);
+      const saved = readDailyWordActivity(storage, nextIdentity, activity.day);
+      identity = nextIdentity;
+      activity = { day: activity.day, added: addActivityCounts(saved.added, activity.added), deleted: addActivityCounts(saved.deleted, activity.deleted) };
+      persist();
+      return this.snapshot();
+    },
+    record(delta) {
+      rollOver();
+      const added = validActivityCount(delta?.added) ? delta.added : 0;
+      const deleted = validActivityCount(delta?.deleted) ? delta.deleted : 0;
+      if (added || deleted) {
+        activity = { ...activity, added: addActivityCounts(activity.added, added), deleted: addActivityCounts(activity.deleted, deleted) };
+        persist();
+      }
+      return this.snapshot();
+    },
+    restore(snapshot) {
+      if (!snapshot || snapshot.day !== getDay() || !validActivityCount(snapshot.added) || !validActivityCount(snapshot.deleted)) return this.snapshot();
+      activity = { day: snapshot.day, added: snapshot.added, deleted: snapshot.deleted };
+      persist();
+      return this.snapshot();
+    },
+    snapshot() { rollOver(); return { ...activity, identity }; },
+  };
+}
+/* DAILY_WORD_ACTIVITY_END */
 
 function invoke(command, args) {
   const core = window.__TAURI__?.core;
@@ -145,6 +287,13 @@ function editorTheme() {
 }
 
 async function start() {
+  // Configuration is a bundled, offline asset. Its failure must never block
+  // writing, so malformed or unavailable content falls back to safe defaults.
+  // The global is intentionally test-only and is absent in normal launches.
+  const appConfig = globalThis.__AMTE_TEST_CONFIG__ === undefined
+    ? await loadAppConfig(appConfigUrl)
+    : validateAppConfig(globalThis.__AMTE_TEST_CONFIG__);
+  applyAppConfig(appConfig);
   let themes;
   let activeThemeId;
   try {
@@ -181,11 +330,12 @@ async function start() {
   const projectPathLabel = document.querySelector('#project-path');
   const documentShell = document.querySelector('#document-shell');
   const themeChrome = document.querySelector('#theme-chrome');
+  const saveIndicator = createSaveIndicatorController({ element: document.querySelector('#save-indicator') });
   const boxFrames = new Set(document.querySelectorAll('.box-frame'));
   const root = document.documentElement;
   let previewing = false;
   let currentProject = null;
-  let currentRelativePath = null;
+   let currentRelativePath = null;
   let currentPath = null;
   let currentDocumentId = null;
   let currentWriteRevision = 0;
@@ -193,7 +343,8 @@ async function start() {
   const treeNodes = new Map();
   const treeRows = new Map();
   let selectedTreePath = null;
-  let documentGeneration = 0;
+   let documentGeneration = 0;
+   let activationGeneration = 0;
   let contentVersion = 0;
   let dirty = false;
   let lastSavedText = null;
@@ -204,6 +355,9 @@ async function start() {
   let latestTotal = 0;
   let chapters = [];
   let selectedChapterIdentity = null;
+  let focusedChapterIdentity = null;
+  let collapsedChapterIdentities = new Set();
+  const chapterRows = new Map();
   let pendingSourceChapterIdentity = null;
   let pendingSourceChapterFocusEditor = true;
   let zoomSteps = 10;
@@ -217,16 +371,27 @@ async function start() {
   const requestFrame = window.requestAnimationFrame?.bind(window) || ((callback) => window.setTimeout(callback, 16));
   const cancelFrame = window.cancelAnimationFrame?.bind(window) || ((frame) => window.clearTimeout(frame));
   const worker = new Worker(new URL('./analysis-worker.js', import.meta.url), { type: 'module' });
-  const benchmarkMode = new URLSearchParams(window.location.search).has('benchmark');
+  const query = new URLSearchParams(window.location.search);
+  const benchmarkMode = query.has('benchmark');
+  const browserCheckMode = benchmarkMode || query.has('browser-check');
   const updateSamples = [];
   let view;
   let activeSearchTerm = '';
   let searchRestoreTarget = null;
   let searchShouldRestoreFocus = false;
   let searchRestoreToEditor = false;
+   const dailyActivity = createDailyWordActivityStore({ storage: localStorage, getDay: localDay });
+   const buffers = new BufferSession();
+   let selectedOpenRequest = 0;
 
   function refreshBoxFrames() {
-    if (root.dataset.theme !== 'vintage-msdos-edit') return;
+    // The edge tracks use text glyphs, so empty the existing tracks before
+    // returning when frames are disabled. This prevents a prior true setting
+    // from leaving a bottom edge available to paint after a false setting.
+    if (!paintsVintageAsciiFrames(root)) {
+      for (const frame of boxFrames) clearBoxFramePaint(frame);
+      return;
+    }
     const computed = getComputedStyle(root);
     const horizontal = computed.getPropertyValue('--theme-box-horizontal').trim();
     const vertical = computed.getPropertyValue('--theme-box-vertical').trim();
@@ -296,76 +461,129 @@ async function start() {
 
   function documentText() { return view.state.doc.toString(); }
 
-  function updateDaily(total) {
-    if (!currentPath) return 0;
-    const key = `amte.daily-baseline.v1:${currentPath}`;
-    const today = localDay();
-    let baseline;
-    try { baseline = JSON.parse(localStorage.getItem(key)); } catch { baseline = null; }
-    if (!baseline || baseline.day !== today || !Number.isFinite(baseline.total)) {
-      baseline = { day: today, total };
-      try { localStorage.setItem(key, JSON.stringify(baseline)); } catch (error) { console.error('Could not persist the daily word baseline:', error); }
-    }
-    return Math.max(total - baseline.total, 0);
+  function updateActivityMetric() {
+    const activity = dailyActivity.snapshot();
+    dailyCount.textContent = `(-): ${activity.deleted} (+): ${activity.added}`;
   }
 
   function updateMetrics(total) {
     latestTotal = total;
     totalCount.textContent = `total: ${total}`;
-    dailyCount.textContent = `${updateDaily(total)}/250`;
+    updateActivityMetric();
   }
 
-  function patchChapters(nextChapters) {
-    const oldByIdentity = new Map();
-    for (const card of chapterList.querySelectorAll('.chapter-card')) oldByIdentity.set(card.dataset.identity, card);
-    const occurrences = new Map();
-    const cards = nextChapters.map((chapter, index) => {
-      const base = `${chapter.level}\u0000${chapter.text}`;
-      const occurrence = occurrences.get(base) || 0;
-      occurrences.set(base, occurrence + 1);
-      const identity = `${base}\u0000${occurrence}`;
-      let card = oldByIdentity.get(identity);
-      if (!card) {
-        card = document.createElement('button');
-        card.type = 'button';
-        card.className = 'chapter-card';
-        card.append(document.createElement('span'), document.createElement('span'));
-        card.children[0].className = 'chapter-number';
-        decorateBoxFrame(card);
-        boxFrameObserver?.observe(card);
-      }
-      card.dataset.identity = identity;
-      card.dataset.chapterIndex = String(index);
-      card.dataset.position = String(chapter.position);
-      card.style.setProperty('--chapter-indent', `${Math.min(chapter.level - 1, 4) * 7}px`);
-      card.children[0].textContent = `${chapter.number} `;
-      card.children[1].textContent = chapter.text || 'Untitled heading';
-      card.setAttribute('aria-label', `Go to heading ${chapter.number}: ${chapter.text || 'Untitled heading'}`);
-      card.setAttribute('aria-current', String(identity === selectedChapterIdentity));
-      return card;
-    });
-    for (const card of oldByIdentity.values()) {
-      if (cards.includes(card)) continue;
-      const frame = card.querySelector('.box-frame');
-      if (frame) boxFrames.delete(frame);
-      boxFrameObserver?.unobserve(card);
-      card.remove();
+  function chapterByIdentity(identity) { return chapters.find((chapter) => chapter.identity === identity) || null; }
+  function chapterChildren(identity) { return chapters.filter((chapter) => chapter.parentIdentity === identity); }
+  function isChapterVisible(chapter) {
+    let parent = chapter?.parentIdentity;
+    while (parent) {
+      if (collapsedChapterIdentities.has(parent)) return false;
+      parent = chapterByIdentity(parent)?.parentIdentity || null;
     }
-    for (const card of cards) chapterList.append(card);
+    return Boolean(chapter);
+  }
+  function visibleChapters() { return chapters.filter(isChapterVisible); }
+  function nearestVisibleChapter(identity) {
+    let chapter = chapterByIdentity(identity);
+    while (chapter && !isChapterVisible(chapter)) chapter = chapterByIdentity(chapter.parentIdentity);
+    return chapter || visibleChapters()[0] || null;
+  }
+  function isChapterDescendant(identity, ancestor) {
+    let chapter = chapterByIdentity(identity);
+    while (chapter?.parentIdentity) {
+      if (chapter.parentIdentity === ancestor) return true;
+      chapter = chapterByIdentity(chapter.parentIdentity);
+    }
+    return false;
+  }
+
+  function createChapterRow() {
+    const row = document.createElement('div');
+    row.className = 'chapter-card';
+    row.setAttribute('role', 'treeitem');
+    const disclosure = document.createElement('button');
+    disclosure.type = 'button'; disclosure.className = 'chapter-disclosure'; disclosure.tabIndex = -1;
+    const title = document.createElement('button');
+    title.type = 'button'; title.className = 'chapter-title';
+    title.append(Object.assign(document.createElement('span'), { className: 'chapter-number' }), Object.assign(document.createElement('span'), { className: 'chapter-label' }));
+    row.append(disclosure, title);
+    decorateBoxFrame(row);
+    boxFrameObserver?.observe(row);
+    return row;
+  }
+
+  function syncChapterRovingTabIndex() {
+    const fallback = nearestVisibleChapter(focusedChapterIdentity || selectedChapterIdentity)?.identity || null;
+    focusedChapterIdentity = fallback;
+    for (const [identity, row] of chapterRows) {
+      const visible = !row.hidden;
+      row.querySelector('.chapter-title').tabIndex = visible && identity === fallback ? 0 : -1;
+      row.querySelector('.chapter-disclosure').tabIndex = -1;
+    }
+  }
+
+  function patchChapters(nextChapters = chapters) {
+    const visible = new Set(visibleChapters().map((chapter) => chapter.identity));
+    const live = new Set();
+    for (const chapter of nextChapters) {
+      const identity = chapter.identity;
+      live.add(identity);
+      let row = chapterRows.get(identity);
+      if (!row) { row = createChapterRow(); chapterRows.set(identity, row); }
+      const hasChildren = chapter.childCount > 0;
+      const title = row.querySelector('.chapter-title');
+      const disclosure = row.querySelector('.chapter-disclosure');
+      row.dataset.identity = identity;
+      row.dataset.chapterIndex = String(chapter.index);
+      row.dataset.position = String(chapter.position);
+      row.style.setProperty('--chapter-level', String(chapter.level));
+      row.setAttribute('aria-level', String(chapter.level));
+      row.setAttribute('aria-current', String(identity === selectedChapterIdentity));
+      row.hidden = !visible.has(identity);
+      row.toggleAttribute('inert', row.hidden);
+      // `hidden` removes the treeitem wrapper (and therefore its frame and
+      // shadow) from layout. Keep the DOM accessibility state explicit too:
+      // inert only prevents interaction, while aria-hidden prevents a cached
+      // accessibility tree from exposing a collapsed descendant between paints.
+      row.setAttribute('aria-hidden', String(row.hidden));
+      if (hasChildren) {
+        row.setAttribute('aria-expanded', String(!collapsedChapterIdentities.has(identity)));
+        disclosure.hidden = false;
+        disclosure.textContent = collapsedChapterIdentities.has(identity) ? '▸' : '▾';
+        disclosure.setAttribute('aria-label', `${collapsedChapterIdentities.has(identity) ? 'Expand' : 'Collapse'} ${chapter.text || 'untitled heading'}`);
+      } else {
+        row.removeAttribute('aria-expanded');
+        disclosure.hidden = true;
+        disclosure.setAttribute('aria-label', 'No subheadings');
+      }
+      title.children[0].textContent = `${chapter.number} `;
+      title.children[1].textContent = chapter.text || 'Untitled heading';
+      title.setAttribute('aria-label', `Go to heading ${chapter.number}: ${chapter.text || 'Untitled heading'}`);
+      chapterList.append(row);
+    }
+    for (const [identity, row] of chapterRows) {
+      if (live.has(identity)) continue;
+      const frame = row.querySelector('.box-frame');
+      if (frame) boxFrames.delete(frame);
+      boxFrameObserver?.unobserve(row);
+      row.remove(); chapterRows.delete(identity);
+    }
+    const resolved = nearestVisibleChapter(selectedChapterIdentity);
+    if (selectedChapterIdentity !== resolved?.identity) markCurrentChapter(resolved?.identity || null, false);
+    syncChapterRovingTabIndex();
     requestAnimationFrame(refreshBoxFrames);
   }
 
-  function selectedChapterCard() {
-    return selectedChapterIdentity
-      ? [...chapterList.querySelectorAll('.chapter-card')].find((card) => card.dataset.identity === selectedChapterIdentity)
-      : null;
-  }
+  function selectedChapterCard() { return chapterRows.get(selectedChapterIdentity) || null; }
 
-  function markCurrentChapter(card) {
-    selectedChapterIdentity = card?.dataset.identity || null;
-    for (const chapterCard of chapterList.querySelectorAll('.chapter-card')) {
-      chapterCard.setAttribute('aria-current', String(chapterCard === card));
+  function markCurrentChapter(identity, persist = true) {
+    selectedChapterIdentity = identity || null;
+    const entry = buffers.active();
+    if (entry) {
+      entry.chapterIdentity = selectedChapterIdentity;
+      if (persist) scheduleRecovery(entry);
     }
+    for (const [chapterIdentity, row] of chapterRows) row.setAttribute('aria-current', String(chapterIdentity === selectedChapterIdentity));
   }
 
   function ensureChapterCardVisible(card) {
@@ -377,21 +595,21 @@ async function start() {
 
   function focusChapterCard(card) {
     if (!card) return;
-    card.focus({ preventScroll: true });
+    focusedChapterIdentity = card.dataset.identity;
+    syncChapterRovingTabIndex();
+    card.querySelector('.chapter-title').focus({ preventScroll: true });
     ensureChapterCardVisible(card);
   }
 
   function navigateToChapter(index, identity = null, { focusEditor = true } = {}) {
     const chapter = chapters[index];
     if (!chapter) return;
-    const card = identity
-      ? [...chapterList.querySelectorAll('.chapter-card')].find((chapterCard) => chapterCard.dataset.identity === identity)
-      : chapterList.querySelector(`.chapter-card[data-chapter-index="${index}"]`);
-    if (card) markCurrentChapter(card);
+    const card = chapterRows.get(identity || chapter.identity);
+    if (card) markCurrentChapter(card.dataset.identity);
     if (analysisVersion !== sourceVersion) {
       pendingSourceChapterIdentity = card?.dataset.identity || identity;
       pendingSourceChapterFocusEditor = focusEditor;
-      worker.postMessage({ type: 'flush', version: sourceVersion });
+      worker.postMessage({ type: 'flush', activation: activationGeneration, version: sourceVersion });
       return;
     }
     if (!previewing) {
@@ -406,22 +624,64 @@ async function start() {
 
   chapterList.addEventListener('click', (event) => {
     const card = event.target.closest?.('.chapter-card');
-    if (card && chapterList.contains(card)) navigateToChapter(Number(card.dataset.chapterIndex), card.dataset.identity);
+    if (!card || !chapterList.contains(card)) return;
+    if (event.target.closest('.chapter-disclosure')) {
+      toggleChapter(card.dataset.identity);
+      return;
+    }
+    if (event.target.closest('.chapter-title')) navigateToChapter(Number(card.dataset.chapterIndex), card.dataset.identity);
   });
 
   chapterList.addEventListener('keydown', (event) => {
-    if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
     const card = event.target.closest?.('.chapter-card');
     if (!card || !chapterList.contains(card)) return;
+    const key = event.key === 'Spacebar' ? ' ' : event.key;
+    if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Enter', ' '].includes(key)) return;
     event.preventDefault();
-    const cards = [...chapterList.querySelectorAll('.chapter-card')];
-    const index = cards.indexOf(card);
-    const nextIndex = Math.max(0, Math.min(cards.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
-    if (nextIndex === index) return;
-    const nextCard = cards[nextIndex];
-    focusChapterCard(nextCard);
-    navigateToChapter(Number(nextCard.dataset.chapterIndex), nextCard.dataset.identity, { focusEditor: false });
+    const identity = card.dataset.identity;
+    const chapter = chapterByIdentity(identity);
+    const visible = visibleChapters();
+    const index = visible.findIndex((item) => item.identity === identity);
+    const move = (target) => {
+      if (!target || target.identity === identity) return;
+      const next = chapterRows.get(target.identity);
+      focusChapterCard(next);
+      navigateToChapter(target.index, target.identity, { focusEditor: false });
+    };
+    if (key === 'ArrowUp') move(visible[Math.max(0, index - 1)]);
+    else if (key === 'ArrowDown') move(visible[Math.min(visible.length - 1, index + 1)]);
+    else if (key === 'Home') move(visible[0]);
+    else if (key === 'End') move(visible.at(-1));
+    else if (key === 'ArrowRight') {
+      if (chapter?.childCount && collapsedChapterIdentities.has(identity)) toggleChapter(identity);
+      else if (chapter?.childCount) move(chapterChildren(identity)[0]);
+    } else if (key === 'ArrowLeft') {
+      if (chapter?.childCount && !collapsedChapterIdentities.has(identity)) toggleChapter(identity);
+      else move(chapterByIdentity(chapter?.parentIdentity));
+    } else if (key === ' ') {
+      if (chapter?.childCount) toggleChapter(identity);
+    } else if (key === 'Enter') navigateToChapter(chapter.index, identity, { focusEditor: false });
   });
+
+  function toggleChapter(identity) {
+    const chapter = chapterByIdentity(identity);
+    if (!chapter?.childCount) return;
+    const collapsing = !collapsedChapterIdentities.has(identity);
+    if (collapsing) collapsedChapterIdentities.add(identity); else collapsedChapterIdentities.delete(identity);
+    if (collapsing && (isChapterDescendant(selectedChapterIdentity, identity) || isChapterDescendant(focusedChapterIdentity, identity))) {
+      markCurrentChapter(identity, false);
+      focusedChapterIdentity = identity;
+    }
+    const entry = buffers.active();
+    if (entry) {
+      entry.collapsedChapterIdentities = [...collapsedChapterIdentities].sort();
+      entry.chapterIdentity = selectedChapterIdentity;
+      scheduleRecovery(entry);
+    }
+    patchChapters();
+    if (collapsing && focusedChapterIdentity === identity) focusChapterCard(chapterRows.get(identity));
+  }
 
   function scrollPreviewToHeading(heading) {
     const previewBounds = preview.getBoundingClientRect();
@@ -433,7 +693,7 @@ async function start() {
   }
 
   function markPreviewChapters() {
-    preview.querySelectorAll('h1, h2, h3, h4, h5').forEach((heading, index) => { heading.dataset.chapterIndex = String(index); });
+    preview.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((heading, index) => { heading.dataset.chapterIndex = String(index); });
     if (pendingPreviewChapter !== null) {
       const target = preview.querySelector(`[data-chapter-index="${pendingPreviewChapter}"]`);
       if (target) scrollPreviewToHeading(target);
@@ -461,6 +721,7 @@ async function start() {
     documentShell.classList.toggle('previewing', previewing);
     preview.hidden = !previewing;
     editorHost.hidden = previewing;
+    const entry = buffers.active(); if (entry) { entry.previewing = previewing; scheduleRecovery(entry); }
     if (previewing) void renderPreview();
     else view.focus();
   }
@@ -522,6 +783,7 @@ async function start() {
 
   function clearSearchState({ closeDialog = false } = {}) {
     activeSearchTerm = '';
+    if (buffers.active()) { buffers.active().searchTerm = ''; scheduleRecovery(buffers.active()); }
     searchInput.value = '';
     searchStatus.textContent = '';
     if (view) {
@@ -533,6 +795,7 @@ async function start() {
 
   function setActiveSearch(term) {
     activeSearchTerm = term;
+    if (buffers.active()) { buffers.active().searchTerm = term; scheduleRecovery(buffers.active()); }
     // The official highlighter is enabled by an open search panel. This panel
     // is deliberately empty—the accessible application dialog owns the UI.
     openSearchPanel(view);
@@ -604,7 +867,7 @@ async function start() {
   function sendInitialAnalysis(document) {
     sourceVersion += 1;
     analysisVersion = -1;
-    worker.postMessage({ type: 'init', version: sourceVersion, document });
+    worker.postMessage({ type: 'init', activation: activationGeneration, version: sourceVersion, document });
   }
 
   function handleUpdate(update) {
@@ -612,18 +875,44 @@ async function start() {
     const started = benchmarkMode ? performance.now() : 0;
     contentVersion += 1;
     dirty = true;
+    const entry = buffers.active();
+    if (entry) {
+      entry.state = update.state;
+      buffers.markEdit(entry);
+      entry.dirty = true;
+      entry.previewing = previewing;
+    }
     sourceVersion += 1;
     const changes = [];
-    update.changes.iterChanges((from, to, _fromB, _toB, inserted) => changes.push({ from, to, inserted: inserted.toString() }));
-    worker.postMessage({ type: 'changes', version: sourceVersion, changes });
+    update.changes.iterChanges((from, to, fromB, toB, inserted) => changes.push({ from, to, fromB, toB, inserted: inserted.toString() }));
+    // This is intentionally synchronous and document-local: worker analysis is
+    // delayed, but activity belongs to this exact CodeMirror transaction.
+    const delta = classifyWordActivity({
+      beforeLength: update.startState.doc.length,
+      afterLength: update.state.doc.length,
+      readBefore: (from, to) => update.startState.sliceDoc(from, to),
+      readAfter: (from, to) => update.state.sliceDoc(from, to),
+      changes,
+    });
+    dailyActivity.record(delta);
+    if (entry) entry.activity = dailyActivity.snapshot();
+    updateActivityMetric();
+    worker.postMessage({ type: 'changes', activation: activationGeneration, version: sourceVersion, changes });
+    if (entry) scheduleRecovery(entry);
     if (benchmarkMode) updateSamples.push(performance.now() - started);
   }
 
-  function createState(document) {
+  function createState(document, selection = null) {
     return EditorState.create({
       doc: document,
+      selection: selection || undefined,
       extensions: [
         history(),
+        ...(appConfig.editor.autoClosePairs ? [
+          EditorState.languageData.of(() => [{ closeBrackets: { brackets: AUTO_CLOSE_BRACKETS } }]),
+          closeBrackets(),
+          keymap.of(closeBracketsKeymap),
+        ] : []),
         keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
         markdown(),
         search({ createPanel: createSearchDecorationPanel }),
@@ -634,11 +923,108 @@ async function start() {
     });
   }
 
+  function captureActiveBuffer() {
+    const entry = buffers.active();
+    if (!entry || !view) return;
+    entry.state = view.state;
+    entry.sourceScroll = { top: view.scrollDOM.scrollTop, left: view.scrollDOM.scrollLeft };
+    entry.selection = { anchor: view.state.selection.main.anchor, head: view.state.selection.main.head };
+    entry.previewScroll = preview.scrollTop;
+    entry.previewing = previewing;
+    entry.searchTerm = activeSearchTerm;
+    entry.chapterIdentity = selectedChapterIdentity;
+    entry.chapterScroll = chapterList.scrollTop;
+    entry.collapsedChapterIdentities = [...collapsedChapterIdentities].sort();
+    entry.headings = chapters;
+    entry.total = latestTotal;
+    entry.activity = dailyActivity.snapshot();
+  }
+
+  async function persistRecovery(entry, sequence, binding) {
+    if (!entry || !binding?.projectId || !buffers.matchesBinding(entry, binding)) return;
+    const current = entry === buffers.active();
+    const state = current ? view.state : entry.state;
+    return invoke('write_recovery_buffer', {
+      projectId: binding.projectId,
+      buffer: {
+        relativePath: entry.relativePath, documentId: entry.documentId, writeRevision: entry.writeRevision, recoverySequence: sequence, dirty: entry.dirty,
+        content: entry.dirty ? state.doc.toString() : null, baselineHash: entry.baselineHash,
+        sourceScroll: entry.sourceScroll, selection: entry.selection, previewScroll: entry.previewScroll, previewing: entry.previewing,
+        searchTerm: entry.searchTerm, chapterIdentity: entry.chapterIdentity, chapterScroll: entry.chapterScroll,
+        collapsedChapterIdentities: entry.collapsedChapterIdentities,
+        activity: entry.activity,
+      },
+    });
+  }
+  function scheduleRecovery(entry) {
+    if (!window.__TAURI__?.core) return;
+    buffers.scheduleRecovery(entry, persistRecovery);
+  }
+  // Project-file writes alone reach this notifier. Recovery snapshots deliberately
+  // bypass it, and bindings reject stale or transitioned buffers.
+  function notifySuccessfulProjectWrite(entry, snapshot) {
+    if (!buffers.matchesBinding(entry, snapshot)) return false;
+    saveIndicator.show();
+    return true;
+  }
+  async function flushRecovery() {
+    if (buffers.persistenceSuppressed) return;
+    captureActiveBuffer();
+    await buffers.flushRecovery(persistRecovery);
+    const project = buffers.project;
+    if (project && !buffers.persistenceSuppressed) await invoke('write_recovery_manifest', { projectId: project.projectId, activePath: buffers.activePath });
+  }
+
+  function activateBuffer(entry) {
+    if (buffers.active() !== entry) captureActiveBuffer();
+    buffers.activate(entry.relativePath);
+    activationGeneration += 1;
+    documentGeneration += 1;
+    currentRelativePath = entry.relativePath;
+    currentPath = currentProject && entry.relativePath ? `${currentProject.root}/${entry.relativePath}` : null;
+    currentDocumentId = entry.documentId;
+    currentWriteRevision = entry.writeRevision;
+    dirty = entry.dirty;
+    lastSavedText = entry.lastSavedText;
+    contentVersion = entry.editSequence;
+    previewing = entry.previewing;
+    activeSearchTerm = entry.searchTerm;
+    selectedChapterIdentity = entry.chapterIdentity;
+    focusedChapterIdentity = entry.chapterIdentity;
+    collapsedChapterIdentities = new Set(entry.collapsedChapterIdentities || []);
+    chapters = entry.headings || [];
+    latestTotal = entry.total || 0;
+    dailyActivity.setIdentity(currentPath);
+    if (entry.activity) dailyActivity.restore(entry.activity);
+    view.setState(entry.state);
+    documentShell.classList.toggle('previewing', previewing); preview.hidden = !previewing; editorHost.hidden = previewing;
+    patchChapters(chapters); updateMetrics(latestTotal);
+    selectedTreePath = entry.relativePath; patchTree();
+    requestFrame(() => { view.scrollDOM.scrollTop = entry.sourceScroll?.top || 0; view.scrollDOM.scrollLeft = entry.sourceScroll?.left || 0; chapterList.scrollTop = entry.chapterScroll || 0; });
+    if (activeSearchTerm) setActiveSearch(activeSearchTerm); else clearSearchState();
+    sendInitialAnalysis(view.state.doc.toString());
+    if (currentProject && entry.documentId) void invoke('select_project_document', { projectId: currentProject.projectId, documentId: entry.documentId }).catch(() => {});
+    if (previewing) { void renderPreview(); requestFrame(() => { preview.scrollTop = entry.previewScroll || 0; }); }
+    if (currentProject && entry.documentId) void invoke('revalidate_project_document', { projectId: currentProject.projectId, documentId: entry.documentId }).then((status) => { if (buffers.active() === entry && status.conflict) { entry.conflict = status.conflict; dirty = true; console.error(status.conflict); } }).catch(() => {});
+    scheduleRecovery(entry);
+  }
+
   view = new EditorView({ state: createState(''), parent: editorHost });
+  view.scrollDOM.addEventListener('scroll', () => { const entry = buffers.active(); if (entry) { entry.sourceScroll = { top: view.scrollDOM.scrollTop, left: view.scrollDOM.scrollLeft }; scheduleRecovery(entry); } }, { passive: true });
+  preview.addEventListener('scroll', () => { const entry = buffers.active(); if (entry) { entry.previewScroll = preview.scrollTop; scheduleRecovery(entry); } }, { passive: true });
+  chapterList.addEventListener('scroll', () => { const entry = buffers.active(); if (entry) { entry.chapterScroll = chapterList.scrollTop; scheduleRecovery(entry); } }, { passive: true });
   worker.onmessage = ({ data }) => {
-    if (data.type !== 'analysis' || data.version !== sourceVersion) return;
+    if (data.type !== 'analysis' || data.activation !== activationGeneration || data.version !== sourceVersion) return;
     analysisVersion = data.version;
+    const previousChapters = chapters;
     chapters = data.headings;
+    const entry = buffers.active();
+    collapsedChapterIdentities = new Set(reconcileCollapsedChapterIdentities(previousChapters, chapters, collapsedChapterIdentities));
+    if (entry) {
+      entry.headings = data.headings; entry.total = data.total; entry.analysisVersion = data.version;
+      entry.collapsedChapterIdentities = [...collapsedChapterIdentities];
+      scheduleRecovery(entry);
+    }
     patchChapters(chapters);
     updateMetrics(data.total);
       if (pendingSourceChapterIdentity) {
@@ -651,6 +1037,7 @@ async function start() {
 
   function setProject(project) {
     clearSearchState({ closeDialog: true });
+    buffers.setProject(project);
     currentProject = project;
     currentRelativePath = null;
     currentPath = null;
@@ -663,27 +1050,33 @@ async function start() {
     updateThemeChrome();
   }
 
-  function replaceDocument(document, { relativePath = null, documentId = null, writeRevision = 0, clean = false } = {}) {
+  function replaceDocument(document, { relativePath = null, documentId = null, writeRevision = 0, baselineHash = null, clean = false, restored = {} } = {}) {
     clearSearchState({ closeDialog: true });
-    documentGeneration += 1;
-    contentVersion += 1;
-    currentRelativePath = relativePath;
-    currentPath = currentProject && relativePath ? `${currentProject.root}/${relativePath}` : null;
-    currentDocumentId = documentId;
-    currentWriteRevision = writeRevision;
-    lastSavedText = clean ? document : null;
-    dirty = !clean;
-    chapters = [];
-    selectedChapterIdentity = null;
-    pendingSourceChapterIdentity = null;
-    patchChapters(chapters);
-    view.setState(createState(document));
-    sendInitialAnalysis(document);
+    const safeRestored = { ...restored, selection: clampRestoredSelection(restored.selection, document) };
+    const existing = buffers.get(relativePath);
+    if (existing && existing.state.doc.toString() === document) { activateBuffer(existing); return; }
+    if (existing) {
+      existing.state = createState(document, safeRestored.selection);
+      existing.documentId = documentId;
+      existing.writeRevision = writeRevision;
+      existing.baselineHash = baselineHash;
+      existing.lastSavedText = clean ? document : existing.lastSavedText;
+      existing.dirty = !clean || Boolean(safeRestored.dirty);
+      existing.searchTerm = ''; existing.headings = []; existing.total = 0;
+      activateBuffer(existing);
+      return;
+    }
+    const entry = buffers.add({ relativePath, documentId, writeRevision, baselineHash, content: document }, createState(document, safeRestored.selection), { ...safeRestored, dirty: !clean || safeRestored.dirty });
+    entry.lastSavedText = clean ? document : entry.lastSavedText;
+    entry.dirty = !clean || Boolean(safeRestored.dirty);
+    activateBuffer(entry);
   }
 
   function applyDocument(document) {
     if (!document || typeof document.content !== 'string' || !Number.isSafeInteger(document.documentId)) return false;
-    replaceDocument(document.content, { relativePath: document.relativePath, documentId: document.documentId, writeRevision: document.writeRevision || 0, clean: true });
+    const existing = buffers.get(document.relativePath);
+    if (existing) activateBuffer(existing);
+    else replaceDocument(document.content, { relativePath: document.relativePath, documentId: document.documentId, writeRevision: document.writeRevision || 0, baselineHash: document.baselineHash, clean: !document.conflict, restored: { dirty: Boolean(document.conflict), conflict: document.conflict } });
     selectedTreePath = document.relativePath;
     patchTree();
     if (previewing) void renderPreview();
@@ -745,7 +1138,8 @@ async function start() {
 
   function focusTree(path = selectedTreePath) { const row = treeRows.get(path) || treeRows.get(visibleTreeNodes()[0]?.path); row?.focus(); }
   function focusChapter() {
-    focusChapterCard(selectedChapterCard() || chapterList.querySelector('.chapter-card'));
+    const chapter = nearestVisibleChapter(selectedChapterIdentity);
+    focusChapterCard(chapter && chapterRows.get(chapter.identity));
   }
   function onTreeKeydown(event) {
     const row = event.currentTarget; const path = row.dataset.path; const nodes = visibleTreeNodes(); const index = nodes.findIndex((item) => item.path === path); const key = treeRowKey(event);
@@ -759,7 +1153,6 @@ async function start() {
   }
 
   function askDirty() {
-    if (!dirty) return Promise.resolve('discard');
     return new Promise((resolve) => {
       const close = () => { dirtyDialog.removeEventListener('close', close); resolve(dirtyDialog.returnValue || 'cancel'); };
       dirtyDialog.addEventListener('close', close, { once: true }); dirtyDialog.showModal();
@@ -768,57 +1161,88 @@ async function start() {
 
   async function saveDocument() {
     if (!currentProject) { console.info('Open a project before saving.'); return false; }
-    const saveGeneration = documentGeneration; const saveVersion = contentVersion; const saveRevision = Math.max(saveVersion, currentWriteRevision); const content = documentText();
+    return saveBuffer(buffers.active(), true);
+  }
+  async function saveBuffer(entry, allowSaveAs = false) {
+    if (!currentProject || !entry || entry.conflict) { if (entry?.conflict) console.error(entry.conflict); return false; }
+    captureActiveBuffer();
+    const isActive = entry === buffers.active();
+    const snapshot = buffers.writeSnapshot(entry); const savingUntitled = entry.documentId === null;
+    if (savingUntitled && !allowSaveAs) return false;
     try {
-      const saved = currentDocumentId === null
-        ? await invoke('save_document_as', { projectId: currentProject.projectId, revision: saveRevision, content })
-        : await invoke('save_document', { projectId: currentProject.projectId, documentId: currentDocumentId, revision: saveRevision, content });
-      if (!saved || documentGeneration !== saveGeneration) return false;
-      currentRelativePath = saved.relativePath; currentPath = `${currentProject.root}/${saved.relativePath}`; currentDocumentId = saved.documentId; currentWriteRevision = saved.writeRevision; selectedTreePath = saved.relativePath;
-      lastSavedText = content; if (contentVersion === saveVersion) dirty = false;
-      if (currentDocumentId && treeNodes.has('')) { treeNodes.get('').loaded = false; await loadDirectory(''); }
-      if (analysisVersion === sourceVersion) updateMetrics(latestTotal);
+      const saved = savingUntitled
+        ? await invoke('save_document_as', { projectId: currentProject.projectId, revision: snapshot.revision, content: snapshot.content })
+        : await invoke('save_document', { projectId: currentProject.projectId, documentId: entry.documentId, revision: snapshot.revision, content: snapshot.content });
+      if (!saved || !notifySuccessfulProjectWrite(entry, snapshot)) return false;
+      entry.documentId = saved.documentId; entry.relativePath = saved.relativePath; entry.baselineHash = saved.baselineHash;
+      if (savingUntitled) { buffers.entries.delete('__untitled__'); buffers.entries.set(entry.relativePath, entry); entry.key = entry.relativePath; if (isActive) buffers.activePath = entry.relativePath; }
+      buffers.applyWriteAck(entry, snapshot, saved);
+      if (isActive) { currentRelativePath = entry.relativePath; currentPath = `${currentProject.root}/${entry.relativePath}`; currentDocumentId = entry.documentId; currentWriteRevision = entry.writeRevision; dirty = entry.dirty; if (savingUntitled) dailyActivity.adoptIdentity(currentPath); }
+      if (treeNodes.has('')) { treeNodes.get('').loaded = false; await loadDirectory(''); }
+      scheduleRecovery(entry); await flushRecovery();
       return true;
-    } catch (error) { console.error('Could not save document:', error); return false; }
+    } catch (error) { if (/CONFLICT/.test(String(error))) buffers.markConflict(entry, error); console.error('Could not save document:', error); return false; }
   }
 
   async function allowTransition() {
-    if (!dirty) return true;
+    const dirtyEntries = [...buffers.entries.values()].filter((entry) => entry.dirty);
+    if (!dirtyEntries.length) return 'clean';
     const action = await askDirty();
-    if (action === 'cancel') return false;
-    return action === 'discard' || await saveDocument();
+    if (action === 'cancel') return 'cancel';
+    if (action === 'discard') return 'discard';
+    for (const entry of dirtyEntries) if (!await saveBuffer(entry, entry === buffers.active())) return 'failed';
+    return 'saved';
   }
 
   async function requestOpenDocument(relativePath) {
     if (!currentProject || transitionInFlight || relativePath === currentRelativePath) return;
-    transitionInFlight = true;
+    const cached = buffers.get(relativePath);
+    if (cached) { activateBuffer(cached); return; }
+    const request = ++selectedOpenRequest;
     try {
-      if (!await allowTransition()) return;
       const projectId = currentProject.projectId;
       const document = await invoke('open_project_document', { projectId, relativePath });
-      if (currentProject?.projectId === projectId) applyDocument(document);
-    } catch (error) { console.error('Could not open project document:', error); } finally { transitionInFlight = false; }
+      if (currentProject?.projectId === projectId && request === selectedOpenRequest) applyDocument(document);
+    } catch (error) { console.error('Could not open project document:', error); }
   }
 
   async function openProject() {
     if (transitionInFlight) return;
     transitionInFlight = true;
+    let autosaveQuiesced = false;
     try {
-      if (!await allowTransition()) return;
-      const project = await invoke('open_project');
-      if (!project) return;
+      // Picking is side-effect free: picker cancellation and Save All failure
+      // retain the old registry, buffers, and recovery data.
+      const candidate = await invoke('pick_project');
+      if (!candidate) return;
+      const decision = await allowTransition();
+      if (decision === 'cancel' || decision === 'failed') return;
+      // Freeze the old session before activation.  This waits out old writes,
+      // snapshots every buffer under its immutable old project binding, and
+      // leaves that recovery set intact if candidate activation fails.
+      await autosave.quiesce();
+      autosaveQuiesced = true;
+      await buffers.drainRecovery();
+      await flushRecovery();
+      const project = await invoke('activate_picked_project', { candidateId: candidate.candidateId, discardPreviousRecovery: decision === 'discard' });
       setProject(project); replaceDocument(DEFAULT_DOCUMENT, { clean: true });
+      autosave.resume();
+      autosaveQuiesced = false;
       treeNodes.set('', { entry: { kind: 'directory', name: '' }, loaded: false, expanded: true, children: [] });
       await loadDirectory('');
-    } catch (error) { console.error('Could not open project:', error); } finally { transitionInFlight = false; }
+    } catch (error) { console.error('Could not open project:', error); } finally { if (autosaveQuiesced) autosave.resume(); transitionInFlight = false; }
   }
 
   async function restoreLastProject() {
     try {
       const restored = await invoke('restore_last_project');
       if (!restored?.project) return false;
-      setProject(restored.project); replaceDocument(restored.document?.content || DEFAULT_DOCUMENT, { relativePath: restored.document?.relativePath || null, documentId: restored.document?.documentId || null, writeRevision: restored.document?.writeRevision || 0, clean: true });
-      if (restored.document) selectedTreePath = restored.document.relativePath;
+      setProject(restored.project);
+      const documents = restored.documents || (restored.document ? [restored.document] : []);
+      for (const document of documents) replaceDocument(document.content, { relativePath: document.relativePath, documentId: document.documentId, writeRevision: document.writeRevision || 0, baselineHash: document.baselineHash, clean: !document.recovery?.dirty && !document.conflict, restored: { ...(document.recovery || {}), dirty: Boolean(document.recovery?.dirty || document.conflict), conflict: document.conflict } });
+      const active = buffers.get(restored.activeRelativePath) || buffers.active();
+      if (active) activateBuffer(active); else replaceDocument(DEFAULT_DOCUMENT, { clean: true });
+      if (active) selectedTreePath = active.relativePath;
       treeNodes.set('', { entry: { kind: 'directory', name: '' }, loaded: false, expanded: true, children: [] });
       await loadDirectory('');
       return true;
@@ -827,13 +1251,27 @@ async function start() {
 
   const autosave = createAutosaveController({
     snapshot() {
-      if (!dirty || !currentProject || currentDocumentId === null) return null;
-      const text = documentText(); if (text === lastSavedText) { dirty = false; return null; }
-      return { documentGeneration, projectId: currentProject.projectId, documentId: currentDocumentId, revision: Math.max(contentVersion, currentWriteRevision), path: currentPath, contentVersion, text };
+      captureActiveBuffer();
+      if (!buffers.project || buffers.persistenceSuppressed) return [];
+      return buffers.autosaveEligible().map((entry) => {
+        const snapshot = buffers.writeSnapshot(entry);
+        return snapshot && { entry, ...snapshot };
+      }).filter(Boolean);
     },
-    write({ projectId, documentId, revision, text }) { return invoke('autosave_document', { projectId, documentId, revision, content: text }); },
-    onSuccess(saved) { if (documentGeneration === saved.documentGeneration && currentProject?.projectId === saved.projectId && currentDocumentId === saved.documentId && currentPath === saved.path) { lastSavedText = saved.text; if (contentVersion === saved.contentVersion) dirty = false; } },
-    onError(error) { console.error('Could not autosave document:', error); }, setIntervalFn: window.setInterval.bind(window), clearIntervalFn: window.clearInterval.bind(window),
+    write(saved) {
+      if (!buffers.matchesBinding(saved.entry, saved)) throw new Error('Stale autosave session');
+      return invoke('autosave_document', { projectId: saved.projectId, documentId: saved.documentId, revision: saved.revision, content: saved.content });
+    },
+    onSuccess(saved, result) {
+      if (!notifySuccessfulProjectWrite(saved.entry, saved)) return;
+      buffers.applyWriteAck(saved.entry, saved, result);
+      if (saved.entry === buffers.active()) { dirty = saved.entry.dirty; currentWriteRevision = saved.entry.writeRevision; }
+      scheduleRecovery(saved.entry);
+    },
+    onError(error, saved) {
+      if (saved && buffers.matchesBinding(saved.entry, saved) && /CONFLICT/.test(String(error))) buffers.markConflict(saved.entry, error);
+      if (!/Stale autosave session/.test(String(error))) console.error('Could not autosave document:', error);
+    }, setIntervalFn: window.setInterval.bind(window), clearIntervalFn: window.clearInterval.bind(window),
   });
 
   function setApplicationZoom(direction) {
@@ -962,14 +1400,137 @@ async function start() {
   if (!await restoreLastProject()) { updateThemeChrome(); replaceDocument(DEFAULT_DOCUMENT, { clean: true }); }
   view.focus();
   autosave.start();
-  window.addEventListener('beforeunload', () => autosave.stop(), { once: true });
-  const app = { view, worker, get sourceVersion() { return sourceVersion; }, get analysisVersion() { return analysisVersion; }, togglePreview, replaceDocument };
+  async function handleNativeClose(requestId) {
+    let closed = false;
+    let closingDiscard = false;
+    let terminalDiscardProjectId = null;
+    const restoreDiscardRecovery = async () => {
+      closingDiscard = false;
+      buffers.resumePersistence();
+      autosave.resume();
+      try { await flushRecovery(); } catch (recoveryError) { console.error('Could not restore recovery after close failure:', recoveryError); }
+    };
+    try {
+      await runCloseFlow({
+        hasDirty: () => [...buffers.entries.values()].some((entry) => entry.dirty),
+        decide: askDirty,
+        saveAll: async () => { for (const entry of [...buffers.entries.values()].filter((item) => item.dirty)) if (!await saveBuffer(entry, entry === buffers.active())) return false; return true; },
+        discardAll: async () => {
+          // This terminal barrier prevents an already-resolved write callback
+          // or beforeunload from recreating the recovery set after deletion.
+          closingDiscard = true;
+          buffers.suppressPersistence();
+          try {
+            await autosave.quiesce();
+            await buffers.drainRecovery();
+            terminalDiscardProjectId = currentProject?.projectId ?? null;
+            return true;
+          } catch (error) {
+            // Keep the window open and restore recoverability if deletion was
+            // rejected; the discard was not final.
+            await restoreDiscardRecovery();
+            console.error('Could not discard recovery:', error);
+            return false;
+          }
+        },
+        flush: async () => { if (!closingDiscard) await flushRecovery(); return true; },
+        close: () => terminalDiscardProjectId === null
+          ? invoke('complete_close')
+          : invoke('discard_recovery_and_exit', { projectId: terminalDiscardProjectId }),
+      }).then(async (outcome) => {
+        if (outcome === 'closed') { closed = true; return; }
+        if (terminalDiscardProjectId !== null) await restoreDiscardRecovery();
+        console.info(`Window close retained: ${outcome}`);
+      });
+    } catch (error) { console.error('Could not complete window close:', error); }
+    finally {
+      // Cancel/save failures reopen the native close gate. A later Super+W
+      // therefore receives a fresh event instead of being prevented forever.
+      if (!closed) {
+        try { await invoke('finish_close_request', { requestId }); } catch (error) { console.error('Could not finish window-close request:', error); }
+      }
+    }
+  }
+  const nativeClose = createCloseRequestGuard(handleNativeClose);
+  async function installNativeCloseListener() {
+    const events = window.__TAURI__?.event;
+    if (!events?.listen) return false;
+    try {
+      const unlisten = await events.listen('amte://close-requested', async ({ payload }) => {
+        const requestId = Number(payload);
+        if (!Number.isSafeInteger(requestId)) return;
+        try {
+          if (await invoke('acknowledge_close_request', { requestId })) await nativeClose.request(requestId);
+        } catch (error) { console.error('Could not acknowledge window-close request:', error); }
+      });
+      try {
+        await invoke('close_listener_ready');
+        return unlisten;
+      } catch (error) {
+        unlisten?.();
+        throw error;
+      }
+    } catch (error) {
+      // Rust remains fail-open until close_listener_ready succeeds, so this
+      // cannot leave a broken frontend window permanently uncloseable.
+      console.error('Could not install window-close listener:', error);
+      return false;
+    }
+  }
+  // Tauri v2 intercepts titlebar/window-manager CloseRequested in Rust only
+  // after this listener has acknowledged installation.
+  await installNativeCloseListener();
+  window.addEventListener('beforeunload', () => { saveIndicator.destroy(); autosave.stop(); void flushRecovery(); }, { once: true });
+  const app = {
+    view,
+    worker,
+    buffers,
+    get sourceVersion() { return sourceVersion; },
+    get analysisVersion() { return analysisVersion; },
+    togglePreview,
+    replaceDocument,
+    // CDP coverage uses this in benchmark mode to exercise file-scoped
+    // storage without granting the browser test any filesystem capability.
+    benchmarkSwitchDocument(project, relativePath, content) {
+      if (!browserCheckMode) return;
+      if (currentProject?.projectId !== project.projectId) setProject(project);
+      const cached = buffers.get(relativePath);
+      if (cached) activateBuffer(cached);
+      else replaceDocument(content, { relativePath, documentId: 1, clean: true });
+    },
+    async browserCheckSave(kind) {
+      if (!browserCheckMode) return false;
+      const entry = buffers.active();
+      if (!entry) return false;
+      entry.dirty = true;
+      entry.editSequence += 1;
+      if (kind === 'autosave') { await autosave.tick(); return true; }
+      if (kind === 'save-as') {
+        const untitled = buffers.add({ content: entry.state.doc.toString() }, createState(entry.state.doc.toString()));
+        buffers.activate(null);
+        return saveBuffer(untitled, true);
+      }
+      if (kind === 'save-all') {
+        for (const candidate of [...buffers.entries.values()].filter((item) => item.dirty)) if (!await saveBuffer(candidate, candidate === buffers.active())) return false;
+        return true;
+      }
+      return saveBuffer(entry, false);
+    },
+  };
   if (benchmarkMode) void runBrowserBenchmark(app, updateSamples, editorHost);
   return app;
 }
 
 async function runBrowserBenchmark(app, updateSamples, editorHost) {
   const source = (`# Benchmark\n\n${'alpha beta gamma delta epsilon zeta eta theta iota kappa\n'.repeat(10000)}`).slice(0, 400 * 1024);
+  const bufferPaths = Array.from({ length: 10 }, (_, index) => `benchmark-${index}.md`);
+  for (const path of bufferPaths) app.benchmarkSwitchDocument({ projectId: 99, root: '/benchmark-project' }, path, source);
+  const switchSamples = [];
+  for (const path of [...bufferPaths, ...bufferPaths].reverse()) {
+    const started = performance.now();
+    app.benchmarkSwitchDocument({ projectId: 99, root: '/benchmark-project' }, path, source);
+    switchSamples.push(performance.now() - started);
+  }
   app.replaceDocument(source);
   updateSamples.length = 0;
   const counts = [];
@@ -996,6 +1557,10 @@ async function runBrowserBenchmark(app, updateSamples, editorHost) {
     converged: app.analysisVersion === app.sourceVersion,
     total: document.querySelector('#total-count')?.textContent,
     chapters: document.querySelectorAll('.chapter-card').length,
+    buffers: [...app.buffers.entries.values()].filter((entry) => entry.relativePath).length,
+    editorViews: editorHost.querySelectorAll('.cm-editor').length,
+    bufferSwitchP95Ms: Number([...switchSamples].sort((left, right) => left - right)[Math.ceil(switchSamples.length * 0.95) - 1].toFixed(3)),
+    approximateHeapBytes: performance.memory?.usedJSHeapSize ?? null,
   };
   document.body.dataset.amteBenchmark = JSON.stringify(result);
   const output = document.createElement('pre');

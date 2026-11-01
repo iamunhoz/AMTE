@@ -6,18 +6,24 @@ export class AnalysisEngine {
     this.delay = delay;
     this.document = '';
     this.version = 0;
+    this.activation = 0;
     this.timer = null;
   }
 
   receive(message) {
     if (message.type === 'flush') {
+      if (message.activation !== undefined && message.activation !== this.activation) return;
       this.version = message.version;
       clearTimeout(this.timer);
       this.timer = null;
       this.analyze();
       return;
     }
-    if (message.type === 'init') this.document = message.document;
+    if (message.type === 'init') {
+      this.document = message.document;
+      this.activation = message.activation || 0;
+    }
+    if (message.activation !== undefined && message.activation !== this.activation) return;
     if (message.type === 'changes') this.document = applyChanges(this.document, message.changes);
     this.version = message.version;
     this.schedule();
@@ -32,7 +38,7 @@ export class AnalysisEngine {
     this.timer = null;
     const documentVersion = this.version;
     const document = this.document;
-    this.post({ type: 'analysis', version: documentVersion, total: wordCount(document), headings: extractHeadings(document) });
+    this.post({ type: 'analysis', activation: this.activation, version: documentVersion, total: wordCount(document), headings: extractHeadings(document) });
   }
 
   terminate() { clearTimeout(this.timer); }
