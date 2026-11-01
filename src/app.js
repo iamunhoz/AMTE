@@ -343,7 +343,8 @@ async function start() {
       fileSaving: entry.saving,
       reconciliationPending: entry.reconciliationPending && !entry.reconciliationError,
       reconciliationError: entry.reconciliationPending && Boolean(entry.reconciliationError),
-      error: Boolean(entry.recoveryError),
+      fileSaveError: Boolean(entry.saveError),
+      recoveryError: Boolean(entry.recoveryError),
       conflict: Boolean(entry.conflict),
     });
   }
@@ -390,6 +391,7 @@ async function start() {
   const query = new URLSearchParams(window.location.search);
   const benchmarkMode = query.has('benchmark');
   const browserCheckMode = benchmarkMode || query.has('browser-check');
+  const browserRecoveryCheckMode = query.has('browser-check-recovery');
   const updateSamples = [];
   let view;
   let activeSearchTerm = '';
@@ -962,15 +964,15 @@ async function start() {
       projectId: binding.projectId,
       sessionToken: binding.sessionToken,
       buffer: {
-        relativePath: entry.relativePath, documentId: snapshot.documentId, writeRevision: snapshot.writeRevision,
+        relativePath: snapshot.relativePath, documentId: snapshot.documentId, writeRevision: snapshot.writeRevision,
         clientEditVersion: snapshot.clientEditVersion, dirty: true,
         content: snapshot.content, baselineHash: snapshot.baselineHash,
         sourceScroll: snapshot.sourceScroll, selection: snapshot.selection, previewScroll: snapshot.previewScroll, previewing: snapshot.previewing,
         searchTerm: snapshot.searchTerm, chapterIdentity: snapshot.chapterIdentity, chapterScroll: snapshot.chapterScroll,
         collapsedChapterIdentities: snapshot.collapsedChapterIdentities,
         activity: snapshot.activity,
-        reconciliationOperationKey: entry.reconciliationOperationKey,
-        reconciliationClientEditVersion: entry.reconciliationSnapshot?.clientEditVersion || null,
+        reconciliationOperationKey: snapshot.reconciliationOperationKey,
+        reconciliationClientEditVersion: snapshot.reconciliationClientEditVersion,
       },
     });
     if (buffers.matchesBinding(entry, binding) && entry === buffers.active()) refreshSaveStatus(entry);
@@ -980,18 +982,41 @@ async function start() {
     // Browser benchmark mocks file writes but intentionally has no isolated
     // recovery DB; never turn that harness limitation into a persistent UI
     // error that masks the file-saved timer state machine.
-    if (browserCheckMode || !window.__TAURI__?.core) return;
+    if ((browserCheckMode && !browserRecoveryCheckMode) || !window.__TAURI__?.core) return;
     buffers.scheduleRecovery(entry, persistRecovery);
+  }
+  async function flushPendingReconciliation(entry) {
+    if (!entry?.reconciliationPending || !entry.reconciliationOperationKey || !buffers.contains(entry)) return true;
+    const binding = buffers.bindingFor(entry);
+    try {
+      scheduleRecovery(entry);
+      await flushRecovery();
+      return true;
+    } catch (error) {
+      // File commitment remains true. Preserve its opaque operation and make
+      // the missing durable recovery acknowledgement visible/blocking.
+      entry.recoveryPending = true;
+      if (!entry.recoveryError) buffers.recordRecoveryError(entry, `Could not durably record committed-save reconciliation: ${error}`, binding);
+      entry.recoveryPending = true;
+      try { scheduleRecovery(entry); } catch { /* the pending key remains live */ }
+      return false;
+    }
   }
   // Project-file writes alone reach this notifier. Recovery snapshots deliberately
   // use their distinct durable state, and bindings reject stale transitions.
   function notifySuccessfulProjectWrite(entry, snapshot) {
     if (!buffers.matchesBinding(entry, snapshot)) return false;
-    if (!entry.reconciliationPending) saveIndicator.show();
+    // The floppy pulse confirms any committed project file globally. Its text
+    // remains bound to the active buffer through refreshSaveStatus.
+    saveIndicator.show();
     return true;
   }
+  function reportIgnoredSaveOutcome(operation, result) {
+    // Reasons are a bounded local enum; never log document content or paths.
+    console.warn(`Ignored stale ${operation} outcome: ${result.reason}`);
+  }
   async function flushRecovery() {
-    if (browserCheckMode || buffers.persistenceSuppressed) return;
+    if ((browserCheckMode && !browserRecoveryCheckMode) || buffers.persistenceSuppressed) return;
     captureActiveBuffer();
     await buffers.flushRecovery(persistRecovery);
     const project = buffers.project;
@@ -1028,7 +1053,7 @@ async function start() {
     sendInitialAnalysis(view.state.doc.toString());
     if (currentProject && entry.documentId) void invoke('select_project_document', { projectId: currentProject.projectId, documentId: entry.documentId }).catch(() => {});
     if (previewing) { void renderPreview(); requestFrame(() => { preview.scrollTop = entry.previewScroll || 0; }); }
-    if (currentProject && entry.documentId) void invoke('revalidate_project_document', { projectId: currentProject.projectId, documentId: entry.documentId }).then((status) => { if (buffers.active() === entry && status.conflict) { entry.conflict = status.conflict; dirty = true; console.error(status.conflict); } }).catch(() => {});
+    if (currentProject && entry.documentId) void invoke('revalidate_project_document', { projectId: currentProject.projectId, documentId: entry.documentId }).then((status) => { if (buffers.active() === entry && status.conflict) { buffers.markConflict(entry, status.conflict); dirty = true; refreshSaveStatus(entry); console.error(status.conflict); } }).catch(() => {});
     scheduleRecovery(entry);
     refreshSaveStatus(entry);
   }
@@ -1225,38 +1250,64 @@ async function start() {
     // authority transaction. Flush that source before presenting the picker;
     // cancel still leaves the same untitled binding authoritative.
     entry.saving = true; if (entry === buffers.active()) refreshSaveStatus(entry);
+    let snapshot = null;
+    let reconciling = false;
+    let reconciliationRetryRequested = false;
+    let reconciliationDurabilityRequired = false;
     try {
-      if (entry.reconciliationPending && entry.reconciliationOperationKey) {
-        return await reconcileSavedOperation(entry);
+      reconciling = entry.reconciliationPending && Boolean(entry.reconciliationOperationKey);
+      if (reconciling) {
+        const complete = await reconcileSavedOperation(entry);
+        reconciliationRetryRequested = entry.reconciliationPending;
+        reconciliationDurabilityRequired = entry.reconciliationPending;
+        return complete;
       }
       if (savingUntitled) await flushRecovery();
       const pendingSnapshot = entry.reconciliationPending ? entry.reconciliationSnapshot : null;
-      const snapshot = pendingSnapshot && pendingSnapshot.content === entry.state.doc.toString()
+      snapshot = pendingSnapshot && pendingSnapshot.content === entry.state.doc.toString()
         ? pendingSnapshot
         : buffers.writeSnapshot(entry);
       const saved = savingUntitled
         ? await invoke('save_document_as', { projectId: currentProject.projectId, sessionToken: currentProject.sessionToken, revision: snapshot.revision, clientEditVersion: snapshot.clientEditVersion, content: snapshot.content, sourceRecovery: { relativePath: null, documentId: null, writeRevision: entry.writeRevision, clientEditVersion: snapshot.clientEditVersion, dirty: true, content: snapshot.content, baselineHash: entry.baselineHash, sourceScroll: entry.sourceScroll, selection: entry.selection, previewScroll: entry.previewScroll, previewing: entry.previewing, searchTerm: entry.searchTerm, chapterIdentity: entry.chapterIdentity, chapterScroll: entry.chapterScroll, collapsedChapterIdentities: [...entry.collapsedChapterIdentities], activity: entry.activity } })
         : await invoke('save_document', { projectId: currentProject.projectId, sessionToken: currentProject.sessionToken, documentId: entry.documentId, revision: snapshot.revision, clientEditVersion: snapshot.clientEditVersion, content: snapshot.content });
       if (!saved?.fileCommitted) {
-        entry.recoveryError = saved?.reconciliationErrorMessage || 'The file was not saved.';
+        buffers.recordSaveError(entry, saved?.reconciliationErrorMessage || 'The file was not saved.', snapshot);
         return false;
       }
       const document = saved.document;
-      buffers.applySaveOutcome(entry, snapshot, saved);
-      if (!notifySuccessfulProjectWrite(entry, snapshot)) return false;
+      const applied = savingUntitled && document
+        ? buffers.applySaveAsOutcome(entry, snapshot, saved, document)
+        : buffers.applySaveOutcome(entry, snapshot, saved);
+      if (!applied.applied) { reportIgnoredSaveOutcome(savingUntitled ? 'Save As' : 'save', applied); return false; }
+      reconciliationRetryRequested = entry.reconciliationPending;
+      reconciliationDurabilityRequired = entry.reconciliationPending;
+      if (!notifySuccessfulProjectWrite(entry, savingUntitled ? buffers.bindingFor(entry) : snapshot)) return false;
       if (!document) {
-        scheduleSaveReconciliation(entry, allowSaveAs);
+        // A committed Save As may not yet expose its destination DTO. Its
+        // opaque operation is queued after this request drops `saving`, so it
+        // never gets silently discarded by the reentrancy fence.
         return false;
       }
-      entry.documentId = document.documentId; entry.relativePath = document.relativePath; entry.baselineHash = document.baselineHash;
-      if (savingUntitled) { buffers.entries.delete('__untitled__'); buffers.entries.set(entry.relativePath, entry); entry.key = entry.relativePath; if (isActive) buffers.activePath = entry.relativePath; }
+      if (!savingUntitled) { entry.documentId = document.documentId; entry.relativePath = document.relativePath; entry.baselineHash = document.baselineHash; }
       if (isActive) { currentRelativePath = entry.relativePath; currentPath = `${currentProject.root}/${entry.relativePath}`; currentDocumentId = entry.documentId; currentWriteRevision = entry.writeRevision; dirty = entry.dirty; if (savingUntitled) dailyActivity.adoptIdentity(currentPath); }
       if (treeNodes.has('')) { treeNodes.get('').loaded = false; await loadDirectory(''); }
-      scheduleRecovery(entry); await flushRecovery();
-      if (entry.reconciliationPending) scheduleSaveReconciliation(entry, false);
+      if (!entry.reconciliationPending) { scheduleRecovery(entry); await flushRecovery(); }
       return !entry.reconciliationPending;
-    } catch (error) { if (/CONFLICT/.test(String(error))) buffers.markConflict(entry, error); else entry.recoveryError = String(error); console.error('Could not save document:', error); return false; }
-    finally { entry.saving = false; if (entry === buffers.active()) refreshSaveStatus(entry); }
+    } catch (error) {
+      if (/CONFLICT/.test(String(error))) buffers.markConflict(entry, error);
+      else if (reconciling) buffers.recordRecoveryError(entry, error, snapshot || buffers.bindingFor(entry));
+      else buffers.recordSaveError(entry, error, snapshot || buffers.bindingFor(entry));
+      console.error('Could not save document:', error); return false;
+    }
+    finally {
+      entry.saving = false;
+      const durableReconciliation = !reconciliationDurabilityRequired || await flushPendingReconciliation(entry);
+      if ((reconciliationRetryRequested || entry.reconciliationPending) && buffers.contains(entry)) {
+        scheduleSaveReconciliation(entry, false);
+      }
+      if (entry === buffers.active()) refreshSaveStatus(entry);
+      if (!durableReconciliation) return false;
+    }
   }
 
   async function reconcileSavedOperation(entry) {
@@ -1268,34 +1319,47 @@ async function start() {
       operationKey: entry.reconciliationOperationKey,
     });
     if (!saved?.fileCommitted) {
-      entry.recoveryError = saved?.reconciliationErrorMessage || 'The committed file could not be reconciled.';
+      buffers.recordRecoveryError(entry, saved?.reconciliationErrorMessage || 'The committed file could not be reconciled.', snapshot);
       return false;
     }
     const wasUntitled = entry.documentId === null;
     const document = saved.document;
-    buffers.applySaveOutcome(entry, snapshot, saved);
-    if (!notifySuccessfulProjectWrite(entry, snapshot)) return false;
-    if (!document) { scheduleSaveReconciliation(entry, false); return false; }
-    entry.documentId = document.documentId; entry.relativePath = document.relativePath; entry.baselineHash = document.baselineHash;
-    if (wasUntitled) { buffers.entries.delete('__untitled__'); buffers.entries.set(entry.relativePath, entry); entry.key = entry.relativePath; if (entry === buffers.active()) buffers.activePath = entry.relativePath; }
+    const applied = wasUntitled && document
+      ? buffers.applySaveAsOutcome(entry, snapshot, saved, document)
+      : buffers.applySaveOutcome(entry, snapshot, saved);
+    if (!applied.applied) { reportIgnoredSaveOutcome('reconciliation', applied); return false; }
+    if (!notifySuccessfulProjectWrite(entry, wasUntitled ? buffers.bindingFor(entry) : snapshot)) return false;
+    if (!document) return false;
+    if (!wasUntitled) { entry.documentId = document.documentId; entry.relativePath = document.relativePath; entry.baselineHash = document.baselineHash; }
     if (entry === buffers.active()) {
       currentRelativePath = entry.relativePath; currentPath = `${currentProject.root}/${entry.relativePath}`;
       currentDocumentId = entry.documentId; currentWriteRevision = entry.writeRevision; dirty = entry.dirty;
       if (wasUntitled) dailyActivity.adoptIdentity(currentPath);
     }
     if (treeNodes.has('')) { treeNodes.get('').loaded = false; await loadDirectory(''); }
-    if (entry.reconciliationPending) scheduleSaveReconciliation(entry, false);
     return !entry.reconciliationPending;
   }
 
-  // Reconciliation is bounded and only retries saved documents: Save As must
-  // never reopen a picker or create a second destination in the background.
+  // Reconciliation is bounded and retries only the opaque backend operation:
+  // it never reopens a picker or creates a second destination in background.
   function scheduleSaveReconciliation(entry, allowSaveAs = false) {
-    if (!entry?.reconciliationPending || !entry.reconciliationOperationKey || entry.reconciliationAttempts >= 3 || entry.saving || allowSaveAs) return;
-    entry.reconciliationAttempts += 1;
-    window.setTimeout(() => {
-      if (entry.reconciliationPending && !entry.saving && buffers.contains(entry)) void saveBuffer(entry, false);
-    }, Math.min(8000, 500 * (2 ** entry.reconciliationAttempts)));
+    if (!entry?.reconciliationPending || !entry.reconciliationOperationKey || entry.reconciliationAttempts >= 3 || entry.saving || allowSaveAs) return false;
+    if (entry.reconciliationTimer !== null) return true;
+    const binding = buffers.bindingFor(entry);
+    try {
+      entry.reconciliationAttempts += 1;
+      entry.reconciliationTimer = window.setTimeout(() => {
+        entry.reconciliationTimer = null;
+        if (entry.reconciliationPending && !entry.saving && buffers.contains(entry)) void saveBuffer(entry, false);
+      }, Math.min(8000, 500 * (2 ** entry.reconciliationAttempts)));
+      return true;
+    } catch (error) {
+      buffers.recordReconciliationError(entry, `Could not schedule committed-save reconciliation: ${error}`, binding);
+      // The opaque key remains in the recovery record; surface the scheduling
+      // failure while preserving a future restart/manual reconciliation path.
+      try { scheduleRecovery(entry); } catch { /* retain the pending status */ }
+      return false;
+    }
   }
 
   async function allowTransition() {
@@ -1315,10 +1379,10 @@ async function start() {
       const key = entry.relativePath || '__untitled__';
       try {
         const complete = await saveBuffer(entry, entry === buffers.active());
-        outcomes[key] = { complete, reconciliationPending: entry.reconciliationPending, conflict: entry.conflict || null, error: entry.recoveryError || null };
+        outcomes[key] = { complete, reconciliationPending: entry.reconciliationPending, conflict: entry.conflict || null, error: entry.saveError || entry.recoveryError || null };
       } catch (error) {
-        entry.recoveryError = String(error);
-        outcomes[key] = { complete: false, reconciliationPending: entry.reconciliationPending, conflict: entry.conflict || null, error: entry.recoveryError };
+        buffers.recordSaveError(entry, error);
+        outcomes[key] = { complete: false, reconciliationPending: entry.reconciliationPending, conflict: entry.conflict || null, error: entry.saveError };
       }
     }
     return { outcomes, complete: Object.values(outcomes).every((outcome) => outcome.complete) };
@@ -1414,15 +1478,18 @@ async function start() {
       return invoke('autosave_document', { projectId: saved.projectId, sessionToken: saved.sessionToken, documentId: saved.documentId, revision: saved.revision, clientEditVersion: saved.clientEditVersion, content: saved.content });
     },
     onSuccess(saved, result) {
-      if (!result?.fileCommitted) { saved.entry.recoveryError = result?.reconciliationErrorMessage || 'Autosave did not commit the file.'; return; }
-      buffers.applySaveOutcome(saved.entry, saved, result);
+      if (!result?.fileCommitted) { buffers.recordSaveError(saved.entry, result?.reconciliationErrorMessage || 'Autosave did not commit the file.', saved); return; }
+      const applied = buffers.applySaveOutcome(saved.entry, saved, result);
+      if (!applied.applied) { reportIgnoredSaveOutcome('autosave', applied); return; }
       if (!notifySuccessfulProjectWrite(saved.entry, saved)) return;
       if (saved.entry === buffers.active()) { dirty = saved.entry.dirty; currentWriteRevision = saved.entry.writeRevision; }
       scheduleRecovery(saved.entry);
       if (saved.entry.reconciliationPending) scheduleSaveReconciliation(saved.entry, false);
+      if (saved.entry === buffers.active()) refreshSaveStatus(saved.entry);
     },
     onError(error, saved) {
       if (saved && buffers.matchesBinding(saved.entry, saved) && /CONFLICT/.test(String(error))) buffers.markConflict(saved.entry, error);
+      else if (saved && buffers.matchesBinding(saved.entry, saved) && !/Stale autosave session/.test(String(error))) buffers.recordSaveError(saved.entry, error, saved);
       if (!/Stale autosave session/.test(String(error))) console.error('Could not autosave document:', error);
     }, setIntervalFn: window.setInterval.bind(window), clearIntervalFn: window.clearInterval.bind(window),
   });
@@ -1647,25 +1714,39 @@ async function start() {
     // storage without granting the browser test any filesystem capability.
     benchmarkSwitchDocument(project, relativePath, content) {
       if (!browserCheckMode) return;
-      if (currentProject?.projectId !== project.projectId) setProject(project);
+      const browserProject = { ...project, sessionToken: project.sessionToken || 'browser-check-session' };
+      if (currentProject?.projectId !== browserProject.projectId || currentProject?.sessionToken !== browserProject.sessionToken) setProject(browserProject);
       const cached = buffers.get(relativePath);
       if (cached) activateBuffer(cached);
       else replaceDocument(content, { relativePath, documentId: 1, clean: true });
+    },
+    browserCheckScheduleRecovery(entry = buffers.active()) {
+      if (!browserCheckMode || !entry) return false;
+      scheduleRecovery(entry);
+      return true;
     },
     async browserCheckSave(kind) {
       if (!browserCheckMode) return false;
       const entry = buffers.active();
       if (!entry) return false;
-      entry.dirty = true;
-      entry.editSequence += 1;
+      if (kind === 'inactive-autosave') {
+        buffers.markConflict(entry, 'Active buffer conflict');
+        refreshSaveStatus(entry);
+        const inactive = buffers.add({ relativePath: 'inactive-pulse.md', documentId: 99, content: entry.state.doc.toString() }, createState(entry.state.doc.toString()));
+        buffers.markEdit(inactive);
+        await autosave.tick();
+        return true;
+      }
+      if (kind !== 'save-all-reconcile') buffers.markEdit(entry);
       if (kind === 'autosave') { await autosave.tick(); return true; }
-      if (kind === 'save-as') {
+      if (kind === 'save-as' || kind === 'save-as-partial') {
         const untitled = buffers.add({ content: entry.state.doc.toString() }, createState(entry.state.doc.toString()));
+        buffers.markEdit(untitled);
         buffers.activate(null);
         return saveBuffer(untitled, true);
       }
-      if (kind === 'save-all') {
-        return (await saveAllBuffers([...buffers.entries.values()].filter((item) => item.dirty))).complete;
+      if (kind === 'save-all' || kind === 'save-all-reconcile') {
+        return (await saveAllBuffers([...buffers.entries.values()].filter((item) => item.dirty || item.reconciliationPending))).complete;
       }
       return saveBuffer(entry, false);
     },

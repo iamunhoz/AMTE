@@ -1,15 +1,18 @@
 export const SAVE_INDICATOR_DURATION_MS = 5000;
 
 export const SAVE_STATUS = Object.freeze({
-  dirty: { priority: 20, text: 'Unsaved changes', icon: '●' },
-  recoveryPending: { priority: 30, text: 'Protecting draft…', icon: '◌' },
-  recoveryDurable: { priority: 40, text: 'Draft protected', icon: '◉' },
-  fileSaving: { priority: 50, text: 'Saving file…', icon: '◌' },
-  fileSaved: { priority: 60, text: 'File saved', icon: '✓', transient: true },
-  reconciliationPending: { priority: 80, text: 'Arquivo salvo; recuperação pendente', icon: '!' },
-  reconciliationError: { priority: 90, text: 'Arquivo salvo; recuperação com erro', icon: '!' },
-  error: { priority: 100, text: 'Recovery or save error', icon: '!' },
-  conflict: { priority: 110, text: 'File conflict needs attention', icon: '!' },
+  dirty: { priority: 20, text: 'Alterações não salvas', icon: '●' },
+  recoveryPending: { priority: 30, text: 'Protegendo rascunho…', icon: '◌' },
+  recoveryDurable: { priority: 40, text: 'Rascunho protegido', icon: '◉' },
+  fileSaving: { priority: 50, text: 'Salvando arquivo…', icon: '◌' },
+  fileSaved: { priority: 60, text: 'Arquivo salvo', icon: '✓', transient: true },
+  fileSaveError: { priority: 100, text: 'Falha ao salvar arquivo', icon: '!' },
+  recoveryError: { priority: 101, text: 'Falha na recuperação do rascunho', icon: '!' },
+  // A committed file is never a total save failure. Keep reconciliation above
+  // residual per-channel errors until its durable outcome is resolved.
+  reconciliationPending: { priority: 105, text: 'Arquivo salvo; recuperação pendente', icon: '!' },
+  reconciliationError: { priority: 106, text: 'Arquivo salvo; recuperação com erro', icon: '!' },
+  conflict: { priority: 110, text: 'Conflito no arquivo requer atenção', icon: '!' },
 });
 
 export function reduceSaveStatus(state = {}) {
@@ -20,36 +23,54 @@ export function reduceSaveStatus(state = {}) {
 
 /** Fixed-size footer slot; only content changes, never footer geometry. */
 export function createSaveIndicatorController({ element, setTimeoutFn = globalThis.setTimeout, clearTimeoutFn = globalThis.clearTimeout, duration = SAVE_INDICATOR_DURATION_MS }) {
-  let timer = null; let destroyed = false; let current = null; let fileSavedActive = false; let latestState = {};
+  let timer = null; let destroyed = false; let current = null; let fileSavedActive = false; let persistentState = {};
   const clear = () => { if (timer !== null) { clearTimeoutFn(timer); timer = null; } };
-  const render = (status) => {
-    current = status; element.hidden = false;
-    if ('dataset' in element) element.dataset.status = status?.name || 'idle';
-    if ('title' in element) element.title = status?.text || 'No save activity';
-    element.setAttribute?.('aria-label', status?.text || 'No save activity');
-    const icon = element.querySelector?.('[data-save-icon]'); if (icon) icon.textContent = status?.icon || '·';
-    const label = element.querySelector?.('[data-save-label]'); if (label) label.textContent = status?.text || 'No save activity';
+  const render = () => {
+    const persistent = reduceSaveStatus(persistentState);
+    const status = persistent || (fileSavedActive ? { name: 'fileSaved', ...SAVE_STATUS.fileSaved } : null);
+    current = status;
+    if (!status) {
+      element.hidden = true;
+      if ('dataset' in element) { element.dataset.status = 'idle'; element.dataset.savePulse = 'false'; }
+      if ('title' in element) element.title = 'No save activity';
+      element.setAttribute?.('aria-label', 'No save activity');
+      return;
+    }
+    element.hidden = false;
+    if ('dataset' in element) {
+      element.dataset.status = status.name;
+      element.dataset.savePulse = fileSavedActive ? 'true' : 'false';
+    }
+    if ('title' in element) element.title = status.text;
+    element.setAttribute?.('aria-label', status.text);
+    // The pulse is global visual confirmation only. Persistent text and ARIA
+    // always describe the active buffer, even when an inactive save succeeds.
+    const icon = element.querySelector?.('[data-save-icon]'); if (icon) icon.textContent = fileSavedActive ? SAVE_STATUS.fileSaved.icon : status.icon;
+    const label = element.querySelector?.('[data-save-label]'); if (label) label.textContent = status.text;
+  };
+  const pulse = () => {
+    if (destroyed) return null;
+    fileSavedActive = true;
+    clear();
+    render();
+    timer = setTimeoutFn(() => {
+      timer = null; if (destroyed) return;
+      fileSavedActive = false;
+      render();
+    }, duration);
+    return current?.name || null;
   };
   return {
-    update(state) {
+    update(state = {}) {
       if (destroyed) return null;
-      latestState = { ...state };
-      // Background recovery acknowledgements must not cancel the accepted
-      // file-save confirmation. Only a persistent error/conflict supersedes it.
-      if (state.error || state.conflict) { fileSavedActive = false; clear(); }
-      if (state.fileSaved) { fileSavedActive = true; clear(); }
-      const status = reduceSaveStatus({ ...latestState, fileSaved: fileSavedActive });
-      render(status);
-      if (fileSavedActive && timer === null) timer = setTimeoutFn(() => {
-        timer = null; if (destroyed) return;
-        fileSavedActive = false;
-        const fallback = reduceSaveStatus({ ...latestState, fileSaved: false });
-        if (fallback) render(fallback); else { current = null; element.hidden = true; }
-      }, duration);
-      return status?.name || null;
+      const { fileSaved, ...nextPersistent } = state;
+      persistentState = nextPersistent;
+      if (fileSaved) return pulse();
+      render();
+      return current?.name || null;
     },
-    show() { return this.update({ fileSaved: true }); },
-    hide() { clear(); fileSavedActive = false; latestState = {}; element.hidden = true; current = null; },
+    show() { return pulse(); },
+    hide() { clear(); fileSavedActive = false; persistentState = {}; element.hidden = true; current = null; },
     get status() { return current?.name || null; },
     destroy() { destroyed = true; this.hide(); },
   };

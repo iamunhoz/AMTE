@@ -25,6 +25,15 @@ function fakeClock() {
   };
 }
 
+function statusElement() {
+  const icon = { textContent: '·' }; const label = { textContent: 'No save activity' };
+  return {
+    hidden: true, dataset: {}, attributes: {}, icon, label,
+    setAttribute(name, value) { this.attributes[name] = value; },
+    querySelector(selector) { return selector === '[data-save-icon]' ? icon : (selector === '[data-save-label]' ? label : null); },
+  };
+}
+
 test('save confirmation is initially hidden, lasts exactly five seconds, and resets from the latest success', () => {
   const clock = fakeClock();
   const element = { hidden: true };
@@ -41,6 +50,20 @@ test('save confirmation is initially hidden, lasts exactly five seconds, and res
   clock.advance(4000);
   indicator.show();
   clock.advance(4999);
+  assert.equal(element.hidden, false);
+  clock.advance(1);
+  assert.equal(element.hidden, true);
+});
+
+test('a fully durable file acknowledgement is visible immediately through 4999ms and hides at 5000ms', () => {
+  const clock = fakeClock();
+  const element = { hidden: true, dataset: {}, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } };
+  const indicator = createSaveIndicatorController({ element, setTimeoutFn: clock.setTimeout.bind(clock), clearTimeoutFn: clock.clearTimeout.bind(clock) });
+  assert.equal(indicator.update({ fileSaved: true }), 'fileSaved');
+  assert.equal(element.hidden, false);
+  assert.match(element.attributes['aria-label'], /arquivo salvo/i);
+  clock.advance(4999);
+  assert.equal(indicator.status, 'fileSaved');
   assert.equal(element.hidden, false);
   clock.advance(1);
   assert.equal(element.hidden, true);
@@ -86,16 +109,37 @@ test('teardown clears the pending save timer and hides the status', () => {
   assert.equal(element.hidden, true);
 });
 
-test('background recovery status cannot cancel file-saved timer, while conflict supersedes it', () => {
-  const clock = fakeClock(); const element = { hidden: true, dataset: {} };
+test('a global floppy pulse preserves persistent active-buffer status through expiry', () => {
+  const clock = fakeClock(); const element = statusElement();
   const indicator = createSaveIndicatorController({ element, setTimeoutFn: clock.setTimeout.bind(clock), clearTimeoutFn: clock.clearTimeout.bind(clock) });
-  indicator.update({ fileSaved: true });
   indicator.update({ recoveryDurable: true });
-  assert.equal(indicator.status, 'fileSaved');
+  indicator.show();
+  assert.equal(indicator.status, 'recoveryDurable');
+  assert.match(element.attributes['aria-label'], /rascunho protegido/i);
+  assert.equal(element.icon.textContent, '✓');
   clock.advance(SAVE_INDICATOR_DURATION_MS);
   assert.equal(indicator.status, 'recoveryDurable');
-  indicator.update({ fileSaved: true }); indicator.update({ conflict: true });
-  assert.equal(indicator.status, 'conflict'); assert.equal(clock.pending, 0);
+  assert.equal(element.icon.textContent, '◉');
+});
+
+test('inactive autosave, Save All, and Save As pulses never replace active conflict text or AX state', () => {
+  const clock = fakeClock(); const element = statusElement();
+  const indicator = createSaveIndicatorController({ element, setTimeoutFn: clock.setTimeout.bind(clock), clearTimeoutFn: clock.clearTimeout.bind(clock) });
+  indicator.update({ conflict: true });
+  const activeLabel = element.attributes['aria-label'];
+  for (const kind of ['inactive-autosave', 'inactive-save-all', 'inactive-save-as']) {
+    indicator.show();
+    assert.equal(indicator.status, 'conflict', kind);
+    assert.equal(element.attributes['aria-label'], activeLabel, kind);
+    assert.equal(element.label.textContent, activeLabel, kind);
+    assert.equal(element.icon.textContent, '✓', kind);
+  }
+  clock.advance(4999);
+  assert.equal(element.icon.textContent, '✓');
+  clock.advance(1);
+  assert.equal(indicator.status, 'conflict');
+  assert.equal(element.attributes['aria-label'], activeLabel);
+  assert.equal(element.icon.textContent, '!');
 });
 
 test('committed-file reconciliation is persistent and never rendered as plain success', () => {
@@ -107,6 +151,31 @@ test('committed-file reconciliation is persistent and never rendered as plain su
   assert.equal(indicator.status, 'reconciliationPending');
   indicator.update({ reconciliationError: true });
   assert.equal(indicator.status, 'reconciliationError');
+});
+
+test('committed reconciliation states outrank residual channel failures and remain specific', () => {
+  const element = { hidden: true, dataset: {}, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } };
+  const indicator = createSaveIndicatorController({ element });
+  indicator.update({ fileSaveError: true, recoveryError: true, reconciliationPending: true });
+  assert.equal(indicator.status, 'reconciliationPending');
+  assert.match(element.attributes['aria-label'], /arquivo salvo; recuperação pendente/i);
+  indicator.update({ fileSaveError: true, recoveryError: true, reconciliationError: true });
+  assert.equal(indicator.status, 'reconciliationError');
+  assert.match(element.attributes['aria-label'], /arquivo salvo; recuperação com erro/i);
+});
+
+test('accessible labels distinguish file-save failure, recovery failure, and conflict', () => {
+  const element = { hidden: true, dataset: {}, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } };
+  const indicator = createSaveIndicatorController({ element });
+  indicator.update({ fileSaveError: true });
+  assert.equal(indicator.status, 'fileSaveError');
+  assert.match(element.attributes['aria-label'], /falha ao salvar arquivo/i);
+  indicator.update({ recoveryError: true });
+  assert.equal(indicator.status, 'recoveryError');
+  assert.match(element.attributes['aria-label'], /falha na recuperação/i);
+  indicator.update({ conflict: true });
+  assert.equal(indicator.status, 'conflict');
+  assert.match(element.attributes['aria-label'], /conflito no arquivo/i);
 });
 
 test('reconciliation status remains exposed through an accessible label', () => {

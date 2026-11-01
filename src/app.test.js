@@ -253,7 +253,7 @@ test('restoration and autosave carry project and document identity', () => {
   assert.match(source, /operationKey: entry\.reconciliationOperationKey/);
   assert.match(source, /writeRevision: snapshot\.writeRevision/);
   assert.match(source, /buffers\.drainRecovery\(\);\s*await flushRecovery\(\);/s);
-  assert.match(source, /if \(browserCheckMode \|\| buffers\.persistenceSuppressed\) return;/);
+  assert.match(source, /if \(\(browserCheckMode && !browserRecoveryCheckMode\) \|\| buffers\.persistenceSuppressed\) return;/);
   assert.match(source, /buffers\.suppressPersistence\(\);/);
 });
 
@@ -294,12 +294,12 @@ test('an old autosave completion cannot schedule recovery after a session switch
   const timers = []; let release; let started;
   const startedWrite = new Promise((resolve) => { started = resolve; });
   const blocked = new Promise((resolve) => { release = resolve; });
-  const session = new BufferSession({ project: { projectId: 1, root: '/old' }, schedule: (fn) => { timers.push(fn); return timers.length - 1; }, cancel: () => {} });
+  const session = new BufferSession({ project: { projectId: 1, root: '/old', sessionToken: 'old-session' }, schedule: (fn) => { timers.push(fn); return timers.length - 1; }, cancel: () => {} });
   const entry = session.add({ relativePath: 'a.md', documentId: 1, content: 'draft' }, { doc: { toString: () => 'draft' } }); session.markEdit(entry);
   const saved = { entry, ...session.writeSnapshot(entry) };
   const controller = createAutosaveController({ snapshot: () => [saved], write: async () => { started(); await blocked; return { writeRevision: 1 }; }, onSuccess: (snapshot, result) => { if (session.matchesBinding(snapshot.entry, snapshot)) { session.applyWriteAck(snapshot.entry, snapshot, result); session.scheduleRecovery(snapshot.entry, async () => {}); } }, onError: () => {}, setIntervalFn: () => 1, clearIntervalFn: () => {} });
   const tick = controller.tick(); await startedWrite;
-  session.setProject({ projectId: 2, root: '/new' }); release(); await tick;
+  session.setProject({ projectId: 2, root: '/new', sessionToken: 'new-session' }); release(); await tick;
   assert.equal(timers.length, 0, 'stale completion could not queue an old recovery write');
   controller.resume(); await controller.quiesce(); controller.resume();
   const replacement = session.add({ relativePath: 'b.md', documentId: 2, content: 'b' }, { doc: { toString: () => 'b' } });
@@ -452,10 +452,22 @@ test('footer status is accessible, fixed-size, and distinguishes recovery from f
   assert.match(styles, /\[data-theme="vintage-msdos-edit"\] \.save-indicator \{ bottom: var\(--metrics-padding-block\); color: var\(--theme-bar-foreground\); \}/);
   assert.match(source, /function notifySuccessfulProjectWrite\(entry, snapshot\) \{[\s\S]*?buffers\.matchesBinding\(entry, snapshot\)[\s\S]*?saveIndicator\.show\(\);/);
   assert.match(source, /if \(!saved\?\.fileCommitted\) \{/);
-  assert.match(source, /if \(!notifySuccessfulProjectWrite\(entry, snapshot\)\) return false;/);
+  assert.match(source, /if \(!notifySuccessfulProjectWrite\(entry, savingUntitled \? buffers\.bindingFor\(entry\) : snapshot\)\) return false;/);
+  assert.match(source, /if \(!notifySuccessfulProjectWrite\(entry, wasUntitled \? buffers\.bindingFor\(entry\) : snapshot\)\) return false;/);
   assert.match(source, /onSuccess\(saved, result\) \{\s*if \(!result\?\.fileCommitted\)/);
   assert.match(source, /reconciliationPending: entry\.reconciliationPending/);
+  assert.match(source, /fileSaveError: Boolean\(entry\.saveError\)/);
+  assert.match(source, /recoveryError: Boolean\(entry\.recoveryError\)/);
+  assert.match(source, /buffers\.recordSaveError\(entry,/);
+  assert.match(source, /buffers\.recordRecoveryError\(entry,/);
+  assert.match(source, /const applied = savingUntitled && document\s*\? buffers\.applySaveAsOutcome\(entry, snapshot, saved, document\)\s*:\s*buffers\.applySaveOutcome\(entry, snapshot, saved\);\s*if \(!applied\.applied\) \{ reportIgnoredSaveOutcome\(savingUntitled \? 'Save As' : 'save', applied\); return false; \}/s);
+  assert.match(source, /const applied = wasUntitled && document\s*\? buffers\.applySaveAsOutcome\(entry, snapshot, saved, document\)\s*:\s*buffers\.applySaveOutcome\(entry, snapshot, saved\);\s*if \(!applied\.applied\) \{ reportIgnoredSaveOutcome\('reconciliation', applied\); return false; \}/s);
+  assert.match(source, /const applied = buffers\.applySaveOutcome\(saved\.entry, saved, result\);\s*if \(!applied\.applied\) \{ reportIgnoredSaveOutcome\('autosave', applied\); return; \}/s);
   assert.match(source, /scheduleSaveReconciliation/);
+  assert.match(source, /finally \{\s*entry\.saving = false;\s*const durableReconciliation = !reconciliationDurabilityRequired \|\| await flushPendingReconciliation\(entry\);\s*if \(\(reconciliationRetryRequested \|\| entry\.reconciliationPending\) && buffers\.contains\(entry\)\) \{\s*scheduleSaveReconciliation\(entry, false\);/s);
+  assert.match(source, /async function flushPendingReconciliation\(entry\) \{[\s\S]*?scheduleRecovery\(entry\);\s*await flushRecovery\(\);/);
+  assert.match(source, /if \(entry\.reconciliationTimer !== null\) return true;/);
+  assert.match(source, /buffers\.recordReconciliationError\(entry, `Could not schedule committed-save reconciliation:/);
   assert.doesNotMatch(source.match(/async function persistRecovery[\s\S]*?function scheduleRecovery/)?.[0] || '', /notifySuccessfulProjectWrite/);
   assert.match(source, /recoveryDurable: entry\.dirty && entry\.recoveryState === 'durable'/);
   assert.match(source, /beforeunload', \(\) => \{ saveIndicator\.destroy\(\); autosave\.stop\(\);/);
