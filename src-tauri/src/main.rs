@@ -234,6 +234,33 @@ fn fail_save_outcome_at(_: SaveOutcomeFault) -> Result<(), String> {
     Ok(())
 }
 
+// The activation CAS marker is audit/one-use-discard cleanup only. It must
+// never decide whether an already fenced session can be published. This test
+// seam proves cleanup failure cannot turn a published backend session into an
+// activation error that leaves the webview on the old project.
+#[cfg(test)]
+thread_local! {
+    static ACTIVATION_CAS_CLEANUP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+fn set_activation_cas_cleanup_fault(enabled: bool) {
+    ACTIVATION_CAS_CLEANUP_FAULT.with(|fault| fault.set(enabled));
+}
+#[cfg(test)]
+fn clear_activation_cas_before_publish_fault() -> Result<(), String> {
+    ACTIVATION_CAS_CLEANUP_FAULT.with(|fault| {
+        if fault.replace(false) {
+            Err("Injected activation CAS cleanup failure".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+#[cfg(not(test))]
+fn clear_activation_cas_before_publish_fault() -> Result<(), String> {
+    Ok(())
+}
+
 /// Everything an asynchronous persistence operation is allowed to retain after
 /// dropping ProjectAuthority. Keeping this as one value makes lock inversion
 /// difficult to reintroduce: callers cannot borrow ActiveProject across I/O.
@@ -2635,15 +2662,59 @@ fn publish_picked_project(
     })
 }
 
-#[tauri::command]
-fn activate_picked_project(
-    app: AppHandle,
-    authority: State<'_, ProjectAuthority>,
-    recovery: State<'_, RecoveryAuthority>,
-    activation: State<'_, ActivationAuthority>,
+fn clear_activation_cas_before_publish(
+    db: &RecoveryDb,
+    recovery: &RecoveryAuthority,
+    old_session: Option<&(u64, String, String)>,
+    session_token: &str,
+) -> Result<(), String> {
+    let _transaction = recovery
+        .0
+        .lock()
+        .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+    clear_activation_cas_before_publish_fault()?;
+    db.clear_activation_cas(
+        old_session.map(|(_, root, token)| (root.as_str(), token.as_str())),
+        session_token,
+    )
+}
+
+/// This is intentionally the final, infallible authority publication. All
+/// filesystem and recovery work must complete (or be declared non-fatal) before
+/// this consumes the candidate, so a command error can never strand the
+/// webview on an old project after Rust has accepted the new session.
+fn publish_project_authority(
+    state: &mut ProjectState,
+    candidate_id: u64,
+    next: ActiveProject,
+) -> ProjectDto {
+    debug_assert!(matches!(
+        state.pending_project.as_ref(),
+        Some((id, root)) if *id == candidate_id && *root == next.root
+    ));
+    state.pending_project.take();
+    let project = ProjectDto {
+        project_id: next.identity,
+        root: next.root.display().to_string(),
+        session_token: next.session_token.clone(),
+    };
+    state.project = Some(next);
+    project
+}
+
+fn activate_picked_project_core<S, D>(
+    authority: &ProjectAuthority,
+    recovery: &RecoveryAuthority,
+    activation: &ActivationAuthority,
     candidate_id: u64,
     discard_previous_recovery: bool,
-) -> Result<ProjectDto, String> {
+    project_store: S,
+    recovery_db: D,
+) -> Result<ProjectDto, String>
+where
+    S: FnOnce() -> Result<ProjectStore, String>,
+    D: FnOnce() -> Result<RecoveryDb, String>,
+{
     let _activation = activation
         .0
         .lock()
@@ -2675,8 +2746,12 @@ fn activate_picked_project(
         (root, identity, session_token, old_session)
     };
     let root_fd = open_directory_path(&root)?;
-    let store = ProjectStore::for_app(&app)?;
+    let store = project_store()?;
     let saved_state = store.state_bytes()?;
+    // Validate the recovery storage before its session fence changes. The
+    // handle is retained through every pre-publication recovery step so no
+    // later `for_app` failure can be returned after authority publication.
+    let db = recovery_db()?;
     let next = ActiveProject {
         root: root.clone(),
         root_fd: Arc::new(root_fd),
@@ -2693,7 +2768,6 @@ fn activate_picked_project(
             .0
             .lock()
             .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-        let db = recovery_db_for_app(&app)?;
         db.transition_active_session(
             old_session
                 .as_ref()
@@ -2711,7 +2785,7 @@ fn activate_picked_project(
                 .0
                 .lock()
                 .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-            recovery_db_for_app(&app)?.rollback_activation_session(
+            db.rollback_activation_session(
                 old_session
                     .as_ref()
                     .map(|(_, root, token)| (root.as_str(), token.as_str())),
@@ -2755,7 +2829,7 @@ fn activate_picked_project(
                 .0
                 .lock()
                 .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-            recovery_db_for_app(&app)?.finalize_activation_discard(
+            db.finalize_activation_discard(
                 old_session
                     .as_ref()
                     .map(|(_, root, token)| (root.as_str(), token.as_str())),
@@ -2769,7 +2843,7 @@ fn activate_picked_project(
                     .0
                     .lock()
                     .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-                recovery_db_for_app(&app)?.rollback_activation_session(
+                db.rollback_activation_session(
                     old_session
                         .as_ref()
                         .map(|(_, root, token)| (root.as_str(), token.as_str())),
@@ -2786,35 +2860,47 @@ fn activate_picked_project(
             };
         }
     }
+    if !discard_previous_recovery {
+        // This marker only proves a subsequent terminal discard may consume
+        // the old session. Ordinary activation does not need it after the CAS.
+        // Cleanup is deliberately best-effort while authority is still old:
+        // retaining the audit marker is safe, whereas failing activation here
+        // would unnecessarily reject a fully fenced new session.
+        let _ = clear_activation_cas_before_publish(
+            &db,
+            recovery,
+            old_session.as_ref(),
+            &session_token,
+        );
+    }
     let mut state = authority
         .0
         .lock()
         .map_err(|_| "Project state is unavailable".to_string())?;
-    // No fallible candidate comparison is allowed after terminal discard. The
-    // activation gate retained above guarantees this is still our candidate.
-    state.pending_project.take();
-    state.project = Some(next);
-    let project = ProjectDto {
-        project_id: identity,
-        root: next_root,
-        session_token: session_token.clone(),
-    };
+    // No fallible operation is allowed after this final authority publication.
+    let project = publish_project_authority(&mut state, candidate_id, next);
     drop(state);
-    // The one-use CAS proof is only required to authorize the discard. Do not
-    // retain an event for ordinary switches after the authority is published.
-    if !discard_previous_recovery {
-        let _transaction = recovery
-            .0
-            .lock()
-            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-        let _ = recovery_db_for_app(&app)?.clear_activation_cas(
-            old_session
-                .as_ref()
-                .map(|(_, root, token)| (root.as_str(), token.as_str())),
-            &session_token,
-        );
-    }
     Ok(project)
+}
+
+#[tauri::command]
+fn activate_picked_project(
+    app: AppHandle,
+    authority: State<'_, ProjectAuthority>,
+    recovery: State<'_, RecoveryAuthority>,
+    activation: State<'_, ActivationAuthority>,
+    candidate_id: u64,
+    discard_previous_recovery: bool,
+) -> Result<ProjectDto, String> {
+    activate_picked_project_core(
+        &authority,
+        &recovery,
+        &activation,
+        candidate_id,
+        discard_previous_recovery,
+        || ProjectStore::for_app(&app),
+        || recovery_db_for_app(&app),
+    )
 }
 
 /// Runs every fallible activation step while the old authority is still live.
@@ -5553,6 +5639,122 @@ mod tests {
         assert_eq!(committed.project_id, 10);
         assert_eq!(state.project.as_ref().unwrap().identity, 10);
         assert!(state.pending_project.is_none());
+    }
+
+    #[test]
+    fn activation_core_cleanup_failure_returns_coherent_new_project_dto() {
+        let base = temp("activation-core-cleanup-failure");
+        let old_root = base.join("old");
+        let new_root = base.join("new");
+        fs::create_dir(&old_root).unwrap();
+        fs::create_dir(&new_root).unwrap();
+        let old_root = canonical_project_root(&old_root).unwrap();
+        let new_root = canonical_project_root(&new_root).unwrap();
+        let authority = ProjectAuthority::default();
+        let recovery = RecoveryAuthority::default();
+        let activation = ActivationAuthority::default();
+        let old = authority.activate_project(old_root).unwrap();
+        let candidate = publish_picked_project(&authority, &activation, new_root).unwrap();
+        let config = base.join("config");
+        let db = RecoveryDb::for_config(&config).unwrap();
+        db.activate_session(&old.root, &old.session_token).unwrap();
+        let store = ProjectStore {
+            directory: config.clone(),
+            state_path: config.join(LAST_PROJECT_FILE),
+            legacy_path: config.join(LEGACY_LAST_DOCUMENT_FILE),
+        };
+
+        set_activation_cas_cleanup_fault(true);
+        let response = activate_picked_project_core(
+            &authority,
+            &recovery,
+            &activation,
+            candidate.candidate_id,
+            false,
+            || Ok(store),
+            || Ok(db.clone()),
+        )
+        .unwrap();
+
+        let state = authority.0.lock().unwrap();
+        let active = state.project.as_ref().unwrap();
+        assert_eq!(response.project_id, active.identity);
+        assert_eq!(response.root, active.root.display().to_string());
+        assert_eq!(response.session_token, active.session_token);
+        assert!(state.pending_project.is_none());
+        drop(state);
+        assert_eq!(
+            db.test_active_session_token(&response.root).unwrap(),
+            Some(response.session_token.clone())
+        );
+        assert_eq!(db.test_active_session_token(&old.root).unwrap(), None);
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["projectId"], response.project_id);
+        assert_eq!(wire["root"], response.root);
+        assert_eq!(wire["sessionToken"], response.session_token);
+        assert!(wire.get("project_id").is_none());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn activation_core_prepublication_failure_keeps_old_authority_and_candidate() {
+        let base = temp("activation-core-prepublication-failure");
+        let old_root = base.join("old");
+        let new_root = base.join("new");
+        fs::create_dir(&old_root).unwrap();
+        fs::create_dir(&new_root).unwrap();
+        let authority = ProjectAuthority::default();
+        let recovery = RecoveryAuthority::default();
+        let activation = ActivationAuthority::default();
+        let old = authority
+            .activate_project(canonical_project_root(&old_root).unwrap())
+            .unwrap();
+        let candidate = publish_picked_project(
+            &authority,
+            &activation,
+            canonical_project_root(&new_root).unwrap(),
+        )
+        .unwrap();
+        let config = base.join("config");
+        let db = RecoveryDb::for_config(&config).unwrap();
+        db.activate_session(&old.root, &old.session_token).unwrap();
+        let blocked_directory = base.join("not-a-directory");
+        fs::write(&blocked_directory, "selector write must fail").unwrap();
+        let store = ProjectStore {
+            directory: blocked_directory,
+            state_path: base.join("missing-selector-backup"),
+            legacy_path: base.join(LEGACY_LAST_DOCUMENT_FILE),
+        };
+
+        assert!(
+            activate_picked_project_core(
+                &authority,
+                &recovery,
+                &activation,
+                candidate.candidate_id,
+                false,
+                || Ok(store),
+                || Ok(db.clone()),
+            )
+            .unwrap_err()
+            .contains("Could not create application config directory")
+        );
+        let state = authority.0.lock().unwrap();
+        assert_eq!(state.project.as_ref().unwrap().identity, old.project_id);
+        assert_eq!(
+            state.project.as_ref().unwrap().session_token,
+            old.session_token
+        );
+        assert_eq!(
+            state.pending_project.as_ref().unwrap().0,
+            candidate.candidate_id
+        );
+        drop(state);
+        assert_eq!(
+            db.test_active_session_token(&old.root).unwrap(),
+            Some(old.session_token)
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -8851,7 +9053,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn recovery_permission_hardening_rejects_links_nonregular_and_escaped_paths() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{PermissionsExt, symlink},
+        };
         let base = temp("recovery-permission-hostile");
         let outside = base.join("outside");
         fs::create_dir(&outside).unwrap();
@@ -8894,6 +9099,14 @@ mod tests {
         fs::create_dir(recovery.join("recovery.sqlite3")).unwrap();
         assert!(RecoveryDb::for_config(&config).is_err());
         fs::remove_dir(recovery.join("recovery.sqlite3")).unwrap();
+        let fifo = recovery.join("recovery.sqlite3");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(
+            RecoveryDb::for_config(&config).is_err(),
+            "FIFO is rejected without blocking"
+        );
+        fs::remove_file(&fifo).unwrap();
         fs::remove_dir_all(base).unwrap();
     }
 
