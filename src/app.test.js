@@ -141,11 +141,12 @@ test('project transitions use Save, Discard, Cancel and scoped commands', () => 
   assert.match(html, /id="dirty-dialog"/);
   assert.match(source, /async function allowTransition/);
   assert.match(source, /action === 'cancel'/);
-  assert.match(source, /for \(const entry of dirtyEntries\) if \(!await saveBuffer/);
+  assert.match(source, /async function saveAllBuffers/);
+  assert.match(source, /return \(await saveAllBuffers\(dirtyEntries\)\)\.complete/);
   assert.match(source, /invoke\('pick_project'/);
   assert.match(source, /invoke\('activate_picked_project'/);
   assert.match(source, /invoke\('open_project_document', \{ projectId, relativePath \}\)/);
-  assert.match(source, /invoke\('save_document_as', \{ projectId: currentProject\.projectId, revision: snapshot\.revision, content: snapshot\.content \}\)/s);
+  assert.match(source, /invoke\('save_document_as', \{ projectId: currentProject\.projectId, sessionToken: currentProject\.sessionToken, revision: snapshot\.revision, clientEditVersion: snapshot\.clientEditVersion, content: snapshot\.content, sourceRecovery:/s);
   assert.match(source, /buffers\.get\(relativePath\)/);
   assert.match(source, /activateBuffer\(cached\)/);
 });
@@ -231,16 +232,29 @@ test('vintage panel bounds derive from the shared content row with one shadow cl
 test('restoration and autosave carry project and document identity', () => {
   assert.match(source, /invoke\('restore_last_project'\)/);
   assert.match(source, /projectId: currentProject\.projectId/);
-  assert.match(source, /invoke\('autosave_document', \{ projectId: saved\.projectId, documentId: saved\.documentId, revision: saved\.revision, content: saved\.content \}\)/);
+  assert.match(source, /invoke\('autosave_document', \{ projectId: saved\.projectId, sessionToken: saved\.sessionToken, documentId: saved\.documentId, revision: saved\.revision, clientEditVersion: saved\.clientEditVersion, content: saved\.content \}\)/);
   assert.match(source, /buffers\.matchesBinding\(saved\.entry, saved\)/);
-  assert.match(source, /buffers\.applyWriteAck/);
+  assert.match(source, /buffers\.applySaveOutcome/);
   assert.match(source, /write_recovery_buffer/);
-  assert.match(source, /recoverySequence: sequence/);
+  assert.match(source, /clientEditVersion: snapshot\.clientEditVersion/);
+  assert.match(source, /dirty: true,/);
+  assert.doesNotMatch(source, /saveReceipt/);
+  assert.doesNotMatch(source, /recoverySequence: sequence/);
   assert.match(source, /buffers\.autosaveEligible\(\)/);
-  assert.match(source, /writeRevision: entry\.writeRevision/);
+  assert.match(source, /invoke\('reconcile_save_operation', \{/);
+  assert.match(source, /operationKey: entry\.reconciliationOperationKey/);
+  assert.match(source, /writeRevision: snapshot\.writeRevision/);
   assert.match(source, /buffers\.drainRecovery\(\);\s*await flushRecovery\(\);/s);
-  assert.match(source, /if \(buffers\.persistenceSuppressed\) return;/);
+  assert.match(source, /if \(browserCheckMode \|\| buffers\.persistenceSuppressed\) return;/);
   assert.match(source, /buffers\.suppressPersistence\(\);/);
+});
+
+test('failed project activation retains the live frontend session until backend success', () => {
+  const activation = source.indexOf("await invoke('activate_picked_project'");
+  const replacement = source.indexOf('setProject(project); replaceDocument', activation);
+  assert.ok(activation >= 0 && replacement > activation);
+  assert.match(source, /catch \(error\) \{ console\.error\('Could not open project:', error\); \}/);
+  assert.match(source, /if \(decision === 'cancel' \|\| decision === 'failed'\) return;/);
 });
 
 test('autosave remains single, exact and non-overlapping', async () => {
@@ -250,6 +264,21 @@ test('autosave remains single, exact and non-overlapping', async () => {
   const first = controller.tick(); await controller.tick();
   assert.equal(writes.length, 1); release(); await first;
   assert.deepEqual(writes, [{ text: 'exact' }]);
+});
+
+test('autosave aggregates mixed outcomes instead of abandoning later buffers', async () => {
+  const completed = [];
+  const controller = createAutosaveController({
+    snapshot: () => [{ entry: { key: 'one' } }, { entry: { key: 'two' } }, { entry: { key: 'three' } }],
+    write: async (value) => { if (value.entry.key === 'two') throw new Error('disk full'); return value.entry.key; },
+    onSuccess: (value) => completed.push(value.entry.key), onError: () => {},
+    setIntervalFn: () => 1, clearIntervalFn: () => {},
+  });
+  const outcomes = await controller.tick();
+  assert.deepEqual(completed, ['one', 'three']);
+  assert.equal(outcomes.one.result, 'one');
+  assert.match(outcomes.two.error, /disk full/);
+  assert.equal(outcomes.three.result, 'three');
 });
 
 test('an old autosave completion cannot schedule recovery after a session switch, while a failed switch can resume', async () => {
@@ -265,6 +294,7 @@ test('an old autosave completion cannot schedule recovery after a session switch
   assert.equal(timers.length, 0, 'stale completion could not queue an old recovery write');
   controller.resume(); await controller.quiesce(); controller.resume();
   const replacement = session.add({ relativePath: 'b.md', documentId: 2, content: 'b' }, { doc: { toString: () => 'b' } });
+  session.markEdit(replacement);
   session.scheduleRecovery(replacement, async () => {});
   assert.equal(timers.length, 1, 'a canceled/failed transition leaves the current session persistable');
 });
@@ -404,17 +434,21 @@ test('both physical page edges and middle-width calculations remain available', 
   assert.match(styles, /\.editor-workspace .*place-items: center/);
 });
 
-test('save confirmation is an isolated accessible footer overlay and every accepted project write shares its notifier', () => {
-  assert.match(html, /id="save-indicator"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"[^>]*aria-label="Documento salvo"[^>]*hidden/);
-  assert.match(html, /<svg class="save-indicator__icon"[^>]*aria-hidden="true"[^>]*focusable="false">/);
-  assert.match(html, /<span class="visually-hidden">Documento salvo<\/span>/);
-  assert.match(styles, /\.save-indicator \{[\s\S]*?position: fixed;[\s\S]*?right:[\s\S]*?bottom:[\s\S]*?display: block;[\s\S]*?visibility: visible;[\s\S]*?opacity: 1;[\s\S]*?z-index: 20;/);
-  assert.match(styles, /\.save-indicator\[hidden\] \{ display: none !important; visibility: hidden; opacity: 0; \}/);
+test('footer status is accessible, fixed-size, and distinguishes recovery from file saves', () => {
+  assert.match(html, /id="save-indicator"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"[^>]*aria-label="No save activity"/);
+  assert.match(html, /data-save-icon[^>]*aria-hidden="true"/);
+  assert.match(html, /data-save-label>No save activity/);
+  assert.match(styles, /\.save-indicator \{[\s\S]*?position: fixed;[\s\S]*?width: 13rem;[\s\S]*?display: flex;[\s\S]*?z-index: 20;/);
+  assert.match(styles, /\.save-indicator\[hidden\] \{ visibility: hidden; opacity: 0; \}/);
   assert.match(styles, /\[data-theme="vintage-msdos-edit"\] \.save-indicator \{ bottom: var\(--metrics-padding-block\); color: var\(--theme-bar-foreground\); \}/);
   assert.match(source, /function notifySuccessfulProjectWrite\(entry, snapshot\) \{[\s\S]*?buffers\.matchesBinding\(entry, snapshot\)[\s\S]*?saveIndicator\.show\(\);/);
-  assert.match(source, /if \(!saved \|\| !notifySuccessfulProjectWrite\(entry, snapshot\)\) return false;/);
-  assert.match(source, /onSuccess\(saved, result\) \{\s*if \(!notifySuccessfulProjectWrite\(saved\.entry, saved\)\) return;/);
+  assert.match(source, /if \(!saved\?\.fileCommitted\) \{/);
+  assert.match(source, /if \(!notifySuccessfulProjectWrite\(entry, snapshot\)\) return false;/);
+  assert.match(source, /onSuccess\(saved, result\) \{\s*if \(!result\?\.fileCommitted\)/);
+  assert.match(source, /reconciliationPending: entry\.reconciliationPending/);
+  assert.match(source, /scheduleSaveReconciliation/);
   assert.doesNotMatch(source.match(/async function persistRecovery[\s\S]*?function scheduleRecovery/)?.[0] || '', /notifySuccessfulProjectWrite/);
+  assert.match(source, /recoveryDurable: entry\.dirty && entry\.recoveryState === 'durable'/);
   assert.match(source, /beforeunload', \(\) => \{ saveIndicator\.destroy\(\); autosave\.stop\(\);/);
 });
 

@@ -1,3 +1,7 @@
+// V1 parsing is retained as an intentionally read-only compatibility parser;
+// it is not part of the V2 runtime writer.
+#![allow(dead_code)]
+
 use std::{
     collections::HashMap,
     ffi::CString,
@@ -5,13 +9,17 @@ use std::{
     io::{Read, Write},
     os::fd::FromRawFd,
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use pulldown_cmark::{Options, Parser, html};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+
+mod recovery_db;
+use recovery_db::RecoveryDb;
 
 const LAST_PROJECT_FILE: &str = "last-project-v1";
 const LEGACY_LAST_DOCUMENT_FILE: &str = "last-document-path";
@@ -22,6 +30,7 @@ const IGNORED_NAMES: &[&str] = &[".git", "node_modules", "target", "dist"];
 struct ProjectDto {
     project_id: u64,
     root: String,
+    session_token: String,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +64,34 @@ struct DocumentDto {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SaveOutcome {
+    /// This is true only after the staged replacement was renamed and re-read
+    /// through the descriptor-bound root. It is deliberately independent from
+    /// every SQLite/selector acknowledgement below.
+    file_committed: bool,
+    recovery_checkpoint_durable: bool,
+    selector_session_state_durable: bool,
+    reconciliation_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reconciliation_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reconciliation_error_message: Option<String>,
+    project_id: u64,
+    session_token: String,
+    document_id: Option<u64>,
+    relative_path: Option<String>,
+    file_identity: Option<String>,
+    write_revision: u64,
+    baseline_hash: String,
+    saved_client_edit_version: u64,
+    content_blake3: String,
+    operation_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<Box<DocumentDto>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RestoreDto {
     project: ProjectDto,
     documents: Vec<DocumentDto>,
@@ -79,8 +116,11 @@ struct FileIdentity {
 #[derive(Debug)]
 struct ActiveProject {
     root: PathBuf,
-    root_fd: File,
+    // An Arc permits an authorization snapshot to retain the descriptor after
+    // the short ProjectAuthority critical section has ended.
+    root_fd: Arc<File>,
     identity: u64,
+    session_token: String,
     documents: HashMap<u64, ActiveDocument>,
     paths: HashMap<PathBuf, u64>,
 }
@@ -139,12 +179,137 @@ fn take_unacknowledged_close_fallback(state: &mut CloseState, request_id: u64) -
         false
     }
 }
-/// Lock ordering is ProjectAuthority (brief identity lookup only), then this
-/// recovery lock. Project locks are always released before recovery I/O.
+/// Lock protocol (enforced by the snapshot helpers below):
+///
+/// 1. ProjectAuthority is held only to copy immutable authorization state or
+///    compare-and-apply a completed operation. It is never held for file I/O,
+///    SQLite, or RecoveryAuthority acquisition.
+/// 2. RecoveryAuthority serializes recovery SQLite transactions. It is never
+///    acquired while ProjectAuthority is held.
+/// 3. Project replacement first snapshots the old session, then deactivates it
+///    under RecoveryAuthority, then activates the new token, and only then
+///    swaps ProjectAuthority. Queued old-token work therefore cannot commit.
 #[derive(Default)]
 struct RecoveryAuthority(Mutex<()>);
 
+/// Serializes complete project activations, including the SQLite token fence,
+/// selector persistence, and the final in-memory authority swap.  It is never
+/// taken by save or recovery paths, so it cannot participate in their lock
+/// ordering.  In particular, holding this gate does *not* permit holding
+/// ProjectAuthority while taking RecoveryAuthority.
+#[derive(Default)]
+struct ActivationAuthority(Mutex<()>);
+
+// SaveOutcome boundaries are test-only observability/failure points. Keeping
+// them here (rather than accepting a command argument) ensures a webview can
+// never select a fault mode in a production build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveOutcomeFault {
+    RenameBeforeOperationJournal,
+    OperationJournalBeforeCheckpoint,
+    CheckpointBeforeSelector,
+    SelectorBeforeResponse,
+}
+#[cfg(test)]
+thread_local! {
+    static SAVE_OUTCOME_FAULT: std::cell::Cell<Option<SaveOutcomeFault>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn set_save_outcome_fault(fault: Option<SaveOutcomeFault>) {
+    SAVE_OUTCOME_FAULT.with(|current| current.set(fault));
+}
+#[cfg(test)]
+fn fail_save_outcome_at(fault: SaveOutcomeFault) -> Result<(), String> {
+    SAVE_OUTCOME_FAULT.with(|current| {
+        if current.get() == Some(fault) {
+            current.set(None);
+            Err(format!("Injected SaveOutcome fault at {fault:?}"))
+        } else {
+            Ok(())
+        }
+    })
+}
+#[cfg(not(test))]
+fn fail_save_outcome_at(_: SaveOutcomeFault) -> Result<(), String> {
+    Ok(())
+}
+
+/// Everything an asynchronous persistence operation is allowed to retain after
+/// dropping ProjectAuthority. Keeping this as one value makes lock inversion
+/// difficult to reintroduce: callers cannot borrow ActiveProject across I/O.
+#[derive(Debug, Clone)]
+struct AuthorizationSnapshot {
+    project_id: u64,
+    root: PathBuf,
+    root_fd: Arc<File>,
+    session_token: String,
+    document_id: Option<u64>,
+    relative_path: Option<PathBuf>,
+    write_revision: Option<u64>,
+    file_identity: Option<FileIdentity>,
+    baseline_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthorityApply<T> {
+    Applied(T),
+    Stale,
+}
+
+fn capture_authorization_snapshot(
+    authority: &ProjectAuthority,
+    project_id: u64,
+    session_token: Option<&str>,
+    document_id: Option<u64>,
+) -> Result<AuthorizationSnapshot, String> {
+    let state = authority
+        .0
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?;
+    let project = state
+        .project
+        .as_ref()
+        .ok_or_else(|| "No project is open".to_string())?;
+    if project.identity != project_id {
+        return Err("The project changed".into());
+    }
+    if session_token.is_some_and(|token| project.session_token != token) {
+        return Err("Stale project session".into());
+    }
+    let document = document_id
+        .map(|id| {
+            project
+                .documents
+                .get(&id)
+                .ok_or_else(|| "Unknown or stale project document".to_string())
+        })
+        .transpose()?;
+    Ok(AuthorizationSnapshot {
+        project_id: project.identity,
+        root: project.root.clone(),
+        root_fd: project.root_fd.clone(),
+        session_token: project.session_token.clone(),
+        document_id,
+        relative_path: document.map(|document| document.relative_path.clone()),
+        write_revision: document.map(|document| document.write_revision),
+        file_identity: document.map(|document| document.file_identity),
+        baseline_hash: document.map(|document| document.baseline_hash.clone()),
+    })
+}
+
 impl ProjectAuthority {
+    fn session_token(root: &Path, identity: u64) -> String {
+        // This is opaque to the webview: only this backend mints it. Including
+        // a process-local identity and clock value prevents it being a stable
+        // frontend-inventable project authority.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        blake3::hash(format!("{}:{identity}:{nanos}", root.display()).as_bytes())
+            .to_hex()
+            .to_string()
+    }
     fn next_id(state: &mut ProjectState) -> u64 {
         state.next_identity = state.next_identity.wrapping_add(1);
         if state.next_identity == 0 {
@@ -160,16 +325,19 @@ impl ProjectAuthority {
             .lock()
             .map_err(|_| "Project state is unavailable".to_string())?;
         let identity = Self::next_id(&mut state);
+        let session_token = Self::session_token(&root, identity);
         state.project = Some(ActiveProject {
             root: root.clone(),
-            root_fd,
+            root_fd: Arc::new(root_fd),
             identity,
+            session_token: session_token.clone(),
             documents: HashMap::new(),
             paths: HashMap::new(),
         });
         Ok(ProjectDto {
             project_id: identity,
             root: root.display().to_string(),
+            session_token,
         })
     }
 }
@@ -219,6 +387,10 @@ struct RecoveryBuffer {
     write_revision: u64,
     #[serde(rename = "recoverySequence", alias = "sequence")]
     sequence: u64,
+    /// Client monotonic edit/metadata generation. V2 allocates `sequence` in
+    /// SQLite; this remains a stale-completion fence, never an ID authority.
+    #[serde(default)]
+    client_edit_version: u64,
     dirty: bool,
     content: Option<String>,
     payload: Option<String>,
@@ -237,6 +409,80 @@ struct RecoveryBuffer {
     // outline and never trusts recovery metadata as document structure.
     collapsed_chapter_identities: Option<Vec<String>>,
     activity: Option<RecoveryActivity>,
+    // This is an opaque backend-issued save journal key, not a path or a
+    // payload capability. It makes a post-rename reconciliation survivable
+    // when the webview restarts before it receives the SaveOutcome.
+    #[serde(default)]
+    reconciliation_operation_key: Option<String>,
+    #[serde(default)]
+    reconciliation_client_edit_version: Option<u64>,
+}
+
+/// Network-facing V2 write contract. It deliberately has no recovery sequence,
+/// payload filename, or payload checksum: those are backend-owned fields.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoveryWriteRequest {
+    relative_path: Option<String>,
+    document_id: Option<u64>,
+    write_revision: u64,
+    client_edit_version: u64,
+    dirty: bool,
+    content: Option<String>,
+    baseline_hash: Option<String>,
+    source_scroll: Option<RecoveryScroll>,
+    selection: Option<RecoverySelection>,
+    preview_scroll: Option<f64>,
+    previewing: Option<bool>,
+    search_term: Option<String>,
+    chapter_identity: Option<String>,
+    chapter_scroll: Option<f64>,
+    collapsed_chapter_identities: Option<Vec<String>>,
+    activity: Option<RecoveryActivity>,
+    reconciliation_operation_key: Option<String>,
+    reconciliation_client_edit_version: Option<u64>,
+}
+impl RecoveryWriteRequest {
+    fn into_buffer(self) -> RecoveryBuffer {
+        RecoveryBuffer {
+            relative_path: self.relative_path,
+            document_id: self.document_id,
+            write_revision: self.write_revision,
+            sequence: 0,
+            client_edit_version: self.client_edit_version,
+            dirty: self.dirty,
+            content: self.content,
+            payload: None,
+            payload_hash: None,
+            payload_bytes: None,
+            baseline_hash: self.baseline_hash,
+            source_scroll: self.source_scroll,
+            selection: self.selection,
+            preview_scroll: self.preview_scroll,
+            previewing: self.previewing,
+            search_term: self.search_term,
+            chapter_identity: self.chapter_identity,
+            chapter_scroll: self.chapter_scroll,
+            collapsed_chapter_identities: self.collapsed_chapter_identities,
+            activity: self.activity,
+            reconciliation_operation_key: self.reconciliation_operation_key,
+            reconciliation_client_edit_version: self.reconciliation_client_edit_version,
+        }
+    }
+}
+fn into_dirty_recovery_request(request: RecoveryWriteRequest) -> Result<RecoveryBuffer, String> {
+    let buffer = request.into_buffer();
+    if !buffer.dirty {
+        return Err(
+            "Recovery invoke accepts dirty snapshots only; saves create clean checkpoints".into(),
+        );
+    }
+    if buffer.client_edit_version == 0 || buffer.client_edit_version > RECOVERY_MAX_SEQUENCE {
+        return Err(
+            "Recovery client edit version is outside the canonical JavaScript-safe range".into(),
+        );
+    }
+    Ok(buffer)
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -510,6 +756,28 @@ impl RecoveryStore {
                 })?;
                 Ok(None)
             }
+        }
+    }
+    /// Migration is intentionally observational: unlike the active V1 writer,
+    /// it must not clean an orphan or otherwise mutate legacy storage while
+    /// deciding whether a V2 import is possible.
+    fn read_bound_read_only(
+        &self,
+        expected_root: &str,
+    ) -> Result<Option<RecoveryManifest>, String> {
+        let expected_key = Self::project_key(expected_root);
+        if self.directory.file_name().and_then(|name| name.to_str()) != Some(expected_key.as_str())
+        {
+            return Err("Recovery directory does not match the expected project namespace".into());
+        }
+        let manifest = self.read()?;
+        if let Some(manifest) = manifest {
+            if manifest.root != expected_root || manifest.project_key != expected_key {
+                return Err("Recovery manifest belongs to a different project".into());
+            }
+            Ok(Some(manifest))
+        } else {
+            Ok(None)
         }
     }
     fn write(&self, manifest: &RecoveryManifest) -> Result<(), String> {
@@ -824,6 +1092,16 @@ fn validate_recovery_write_buffer(buffer: &RecoveryBuffer) -> Result<(), String>
     if buffer.dirty && recovery_is_file_bound(buffer) && !valid_file_bound_baseline(buffer) {
         return Err("Dirty file recovery requires a valid baseline hash".into());
     }
+    if buffer
+        .reconciliation_operation_key
+        .as_deref()
+        .is_some_and(|key| !valid_blake3_hex(key))
+        || buffer
+            .reconciliation_client_edit_version
+            .is_some_and(|version| version == 0 || version > RECOVERY_MAX_SEQUENCE)
+    {
+        return Err("Recovery reconciliation metadata is invalid".into());
+    }
     Ok(())
 }
 
@@ -1042,21 +1320,156 @@ fn write_recovery_transaction(
     Ok(store.finish_recovery_commit(&next_manifest))
 }
 
+fn recovery_db_for_app(app: &AppHandle) -> Result<RecoveryDb, String> {
+    let config = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("Could not locate recovery storage: {e}"))?;
+    RecoveryDb::for_config(&config)
+}
+
+/// V1 remains read-only. Every legacy byte is validated through the existing
+/// no-follow/private parser before this function gives SQLite a detached copy.
+fn import_legacy_recovery_once(
+    app: &AppHandle,
+    db: &RecoveryDb,
+    canonical_root: &str,
+) -> Result<(), String> {
+    let store = RecoveryStore::for_root(app, canonical_root)?;
+    import_legacy_recovery_store_once(&store, db, canonical_root)
+}
+
+fn import_legacy_recovery_store_once(
+    store: &RecoveryStore,
+    db: &RecoveryDb,
+    canonical_root: &str,
+) -> Result<(), String> {
+    match fs::symlink_metadata(&store.directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Could not inspect legacy recovery: {error}")),
+        Ok(_) => {}
+    }
+    let Some(manifest) = store.read_bound_read_only(canonical_root)? else {
+        return Ok(());
+    };
+    if manifest.root != canonical_root
+        || manifest.project_key != RecoveryStore::project_key(canonical_root)
+    {
+        return Err("Legacy recovery root binding is invalid".into());
+    }
+    let manifest_hash = blake3::hash(&serde_json::to_vec(&manifest).map_err(|e| e.to_string())?)
+        .to_hex()
+        .to_string();
+    let mut buffers = Vec::with_capacity(manifest.buffers.len());
+    for metadata in &manifest.buffers {
+        let payload = store.read_payload(
+            metadata
+                .payload
+                .as_deref()
+                .ok_or_else(|| "Legacy recovery payload is missing".to_string())?,
+            metadata
+                .payload_bytes
+                .ok_or_else(|| "Legacy recovery payload size is missing".to_string())?,
+            metadata
+                .payload_hash
+                .as_deref()
+                .ok_or_else(|| "Legacy recovery payload hash is missing".to_string())?,
+        )?;
+        if payload.relative_path != metadata.relative_path
+            || payload.document_id != metadata.document_id
+            || payload.sequence != metadata.sequence
+            || payload.write_revision != metadata.write_revision
+            || payload.dirty != metadata.dirty
+            || payload.baseline_hash != metadata.baseline_hash
+        {
+            return Err("Legacy recovery payload does not match its manifest".into());
+        }
+        let mut imported = payload;
+        imported.payload = None;
+        imported.payload_hash = None;
+        imported.payload_bytes = None;
+        imported.client_edit_version = 0;
+        validate_recovery_write_buffer(&imported)?;
+        buffers.push(imported);
+    }
+    db.import_legacy(
+        canonical_root,
+        manifest.active_path.as_deref(),
+        &manifest_hash,
+        &buffers,
+    )?;
+    Ok(())
+}
+
+/// Startup must privilege committed V2 state or a terminal migration over
+/// untrusted legacy bytes. An empty project row is not a migration marker.
+/// closure defers all legacy path traversal until SQLite proved migration is
+/// genuinely pending.
+fn restore_v2_before_legacy<F>(
+    db: &RecoveryDb,
+    canonical_root: &str,
+    import_legacy: F,
+) -> Result<Option<recovery_db::RestoredRecovery>, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    if db.has_committed_recovery_or_terminal_migration(canonical_root)? {
+        return db.latest(canonical_root);
+    }
+    import_legacy()?;
+    db.latest(canonical_root)
+}
+
+fn capture_recovery_authorization(
+    authority: &ProjectAuthority,
+    project_id: u64,
+    session_token: &str,
+    buffer: &RecoveryBuffer,
+) -> Result<AuthorizationSnapshot, String> {
+    let snapshot = capture_authorization_snapshot(
+        authority,
+        project_id,
+        Some(session_token),
+        buffer.document_id,
+    )?;
+    match (&buffer.relative_path, buffer.document_id) {
+        (Some(path), Some(id)) => {
+            let relative = validate_relative(path, true)?;
+            if snapshot.document_id != Some(id)
+                || snapshot.relative_path.as_deref() != Some(relative.as_path())
+                || snapshot.write_revision != Some(buffer.write_revision)
+                || snapshot.baseline_hash.as_deref() != buffer.baseline_hash.as_deref()
+            {
+                return Err("Stale recovery document binding".into());
+            }
+        }
+        (None, None) => {}
+        _ => return Err("Recovery buffer identity is incomplete".into()),
+    }
+    Ok(snapshot)
+}
+
 #[tauri::command]
 fn write_recovery_buffer(
     app: AppHandle,
     authority: State<'_, ProjectAuthority>,
     recovery: State<'_, RecoveryAuthority>,
     project_id: u64,
-    buffer: RecoveryBuffer,
-) -> Result<RecoveryWriteResult, String> {
-    let root = recovery_project_root(&authority, project_id)?;
+    session_token: String,
+    buffer: RecoveryWriteRequest,
+) -> Result<recovery_db::SnapshotAck, String> {
+    let buffer = into_dirty_recovery_request(buffer)?;
+    let snapshot = capture_recovery_authorization(&authority, project_id, &session_token, &buffer)?;
     let _transaction = recovery
         .0
         .lock()
         .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-    let store = RecoveryStore::for_root(&app, &root)?;
-    write_recovery_transaction(&store, &root, buffer)
+    recovery_db_for_app(&app)?.write_snapshot_for_session(
+        &snapshot.root.display().to_string(),
+        None,
+        &snapshot.session_token,
+        &buffer,
+    )
 }
 
 #[tauri::command]
@@ -1067,30 +1480,19 @@ fn write_recovery_manifest(
     project_id: u64,
     active_path: Option<String>,
 ) -> Result<(), String> {
-    let root = recovery_project_root(&authority, project_id)?;
     if active_path
         .as_deref()
         .is_some_and(|path| validate_relative(path, true).is_err())
     {
         return Err("Invalid active recovery path".into());
     }
+    let snapshot = capture_authorization_snapshot(&authority, project_id, None, None)?;
     let _transaction = recovery
         .0
         .lock()
         .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-    let store = RecoveryStore::for_root(&app, &root)?;
-    let mut manifest = store.read_bound(&root)?.unwrap_or(RecoveryManifest {
-        version: RECOVERY_VERSION,
-        root: root.clone(),
-        project_key: RecoveryStore::project_key(&root),
-        active_path: None,
-        buffers: Vec::new(),
-    });
-    if manifest.root != root {
-        return Err("Recovery root does not match the active project".into());
-    }
-    manifest.active_path = active_path;
-    store.write(&manifest)
+    recovery_db_for_app(&app)?
+        .set_active_path(&snapshot.root.display().to_string(), active_path.as_deref())
 }
 
 #[tauri::command]
@@ -1100,12 +1502,15 @@ fn delete_recovery_project(
     recovery: State<'_, RecoveryAuthority>,
     project_id: u64,
 ) -> Result<(), String> {
-    let root = recovery_project_root(&authority, project_id)?;
+    let snapshot = capture_authorization_snapshot(&authority, project_id, None, None)?;
     let _transaction = recovery
         .0
         .lock()
         .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-    RecoveryStore::for_root(&app, &root)?.clear()
+    recovery_db_for_app(&app)?.deactivate_and_discard_session(
+        &snapshot.root.display().to_string(),
+        &snapshot.session_token,
+    )
 }
 impl ProjectStore {
     fn for_app(app: &AppHandle) -> Result<Self, String> {
@@ -1123,6 +1528,34 @@ impl ProjectStore {
         let text = fs::read_to_string(&self.state_path).ok()?;
         let state: StoredProject = serde_json::from_str(&text).ok()?;
         (state.version == 1).then_some(state)
+    }
+    fn state_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        match fs::read(&self.state_path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("Could not read project state backup: {error}")),
+        }
+    }
+    fn restore_state_bytes(&self, saved: Option<&[u8]>) -> Result<(), String> {
+        match saved {
+            Some(bytes) => {
+                fs::create_dir_all(&self.directory).map_err(|error| {
+                    format!("Could not restore application config directory: {error}")
+                })?;
+                let temp = self
+                    .state_path
+                    .with_extension(format!("restore-{}", std::process::id()));
+                fs::write(&temp, bytes)
+                    .map_err(|error| format!("Could not restore project state: {error}"))?;
+                fs::rename(&temp, &self.state_path)
+                    .map_err(|error| format!("Could not replace restored project state: {error}"))
+            }
+            None => match fs::remove_file(&self.state_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("Could not clear staged project state: {error}")),
+            },
+        }
     }
     fn write(&self, root: &Path, relative_path: Option<&Path>) -> Result<(), String> {
         fs::create_dir_all(&self.directory)
@@ -1259,6 +1692,38 @@ mod secure_fs {
             hook();
         }
     }
+
+    /// Save-boundary failures are deliberately test-only. They model a full
+    /// disk/I/O error at a particular persistence boundary without ever
+    /// directing a destructive test at a user project.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum SaveFault {
+        BeforeStageWrite,
+        AfterStageFsync,
+        BeforeRename,
+        AfterRenameAckLoss,
+        DirectoryFsync,
+    }
+    #[cfg(test)]
+    thread_local! {
+        static SAVE_FAULT: std::cell::Cell<Option<SaveFault>> = const { std::cell::Cell::new(None) };
+    }
+    #[cfg(test)]
+    pub(super) fn set_save_fault(fault: Option<SaveFault>) {
+        SAVE_FAULT.with(|current| current.set(fault));
+    }
+    #[cfg(test)]
+    fn fail_save_at(fault: SaveFault) -> Result<(), String> {
+        SAVE_FAULT.with(|current| {
+            if current.get() == Some(fault) {
+                current.set(None);
+                Err(format!("Injected persistence fault at {fault:?}"))
+            } else {
+                Ok(())
+            }
+        })
+    }
     #[cfg(not(test))]
     fn run_test_hook() {}
 
@@ -1354,6 +1819,8 @@ mod secure_fs {
         temporary: &Path,
         content: &str,
     ) -> Result<FileIdentity, String> {
+        #[cfg(test)]
+        fail_save_at(SaveFault::BeforeStageWrite)?;
         let mut staged = openat2(
             parent.as_raw_fd(),
             temporary,
@@ -1369,6 +1836,12 @@ mod secure_fs {
             drop(staged);
             cleanup_staging(parent, temporary);
             return Err(format!("Could not stage project document: {error}"));
+        }
+        #[cfg(test)]
+        if let Err(error) = fail_save_at(SaveFault::AfterStageFsync) {
+            drop(staged);
+            cleanup_staging(parent, temporary);
+            return Err(error);
         }
         Ok(identity)
     }
@@ -1483,10 +1956,22 @@ mod secure_fs {
                 return Err(error);
             }
         }
+        #[cfg(test)]
+        if let Err(error) = fail_save_at(SaveFault::BeforeRename) {
+            cleanup_staging(&parent, &temporary);
+            return Err(error);
+        }
         if let Err(error) = commit_staged(&parent, &temporary, target, create_new) {
             cleanup_staging(&parent, &temporary);
             return Err(error);
         }
+        #[cfg(test)]
+        fail_save_at(SaveFault::AfterRenameAckLoss)?;
+        #[cfg(test)]
+        fail_save_at(SaveFault::DirectoryFsync)?;
+        parent
+            .sync_all()
+            .map_err(|error| format!("Could not sync project directory after save: {error}"))?;
         Ok(replacement_identity)
     }
     pub(super) fn entries_at(root: &File, relative: &Path) -> Result<Vec<fs::DirEntry>, String> {
@@ -1565,6 +2050,37 @@ fn hash_content(content: &str) -> String {
     blake3::hash(content.as_bytes()).to_hex().to_string()
 }
 
+fn file_identity_text(identity: FileIdentity) -> String {
+    format!("{}:{}", identity.device, identity.inode)
+}
+
+/// Stable across acknowledgement loss and process restart, but scoped to the
+/// backend-issued session capability. The frontend never supplies this key.
+fn save_operation_key(
+    snapshot: &AuthorizationSnapshot,
+    source: &str,
+    destination: &str,
+    revision: u64,
+    client_edit_version: u64,
+    content_hash: &str,
+) -> String {
+    blake3::hash(
+        format!(
+            "save-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            snapshot.root.display(),
+            snapshot.session_token,
+            source,
+            destination,
+            revision,
+            client_edit_version,
+            content_hash,
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
 fn document_dto(
     project: &ActiveProject,
     document: &ActiveDocument,
@@ -1615,53 +2131,52 @@ fn activate_document(
     Ok(identity)
 }
 
-// Recovery snapshots are bound to the backend-issued document identity. Keep
-// that identity when rebuilding the in-memory registry so the next recovery
-// sequence remains bound to the same manifest entry rather than being rejected
-// as a different document after restart.
+fn activate_document_with_identity(
+    state: &mut ProjectState,
+    relative_path: PathBuf,
+    identity: u64,
+    file_identity: FileIdentity,
+    content: &str,
+    write_revision: u64,
+) -> Result<u64, String> {
+    if identity == 0 {
+        return Err("Document identity is invalid".into());
+    }
+    let project = state
+        .project
+        .as_mut()
+        .ok_or_else(|| "No project is open".to_string())?;
+    if project.paths.contains_key(&relative_path) || project.documents.contains_key(&identity) {
+        return Err("Save As destination is already active".into());
+    }
+    project.paths.insert(relative_path.clone(), identity);
+    project.documents.insert(
+        identity,
+        ActiveDocument {
+            relative_path,
+            identity,
+            file_identity,
+            write_revision,
+            baseline_hash: hash_content(content),
+        },
+    );
+    Ok(identity)
+}
+
+// Historical recovery IDs are evidence, never a capability for a newly opened
+// backend session. Reserve them before restoration and issue a new opaque ID.
 fn activate_recovered_document(
     state: &mut ProjectState,
     relative_path: PathBuf,
     file_identity: FileIdentity,
     content: &str,
     write_revision: u64,
-    document_id: u64,
+    historical_document_id: u64,
 ) -> Result<u64, String> {
-    if document_id == 0 {
+    if historical_document_id == 0 {
         return Err("Recovery document identity is invalid".into());
     }
-    if let Some(existing) = state
-        .project
-        .as_ref()
-        .and_then(|project| project.paths.get(&relative_path).copied())
-    {
-        return (existing == document_id)
-            .then_some(existing)
-            .ok_or_else(|| "Recovery path is already bound to another document".to_string());
-    }
-    let project = state
-        .project
-        .as_ref()
-        .ok_or_else(|| "No project is open".to_string())?;
-    if project.documents.contains_key(&document_id) {
-        return Err("Recovery document identity is already bound to another path".into());
-    }
-    // Keep subsequent opaque IDs ahead of the recovered binding. A max-value
-    // legacy ID can still safely wrap to a currently unused nonzero value.
-    state.next_identity = state.next_identity.max(document_id);
-    let project = state.project.as_mut().expect("project was checked above");
-    project.paths.insert(relative_path.clone(), document_id);
-    project.documents.insert(
-        document_id,
-        ActiveDocument {
-            relative_path,
-            identity: document_id,
-            file_identity,
-            write_revision,
-            baseline_hash: hash_content(content),
-        },
-    );
-    Ok(document_id)
+    activate_document(state, relative_path, file_identity, content, write_revision)
 }
 
 fn document_status(project: &ActiveProject, document_id: u64) -> Result<(), String> {
@@ -1689,8 +2204,13 @@ fn write_document_revision(
         .documents
         .get(&document_id)
         .ok_or_else(|| "Unknown or stale project document".to_string())?;
-    if revision <= document.write_revision {
+    if revision < document.write_revision {
         return Err("A newer document revision was already saved".into());
+    }
+    if revision == document.write_revision {
+        return (document.baseline_hash == hash_content(content))
+            .then_some(())
+            .ok_or_else(|| "A different document revision was already saved".into());
     }
     document_status(project, document_id)?;
     let relative_path = document.relative_path.clone();
@@ -1716,6 +2236,318 @@ fn write_document_revision(
     document.write_revision = revision;
     document.baseline_hash = hash_content(&committed);
     Ok(())
+}
+
+fn backend_clean_checkpoint(
+    db: &RecoveryDb,
+    root: &str,
+    document: &ActiveDocument,
+    client_edit_version: u64,
+) -> Result<recovery_db::SnapshotAck, String> {
+    db.write_clean_checkpoint(
+        root,
+        &relative_string(&document.relative_path),
+        document.identity,
+        document.write_revision,
+        client_edit_version,
+        document.baseline_hash.clone(),
+    )
+}
+
+fn backend_clean_checkpoint_for_session(
+    db: &RecoveryDb,
+    root: &str,
+    document: &ActiveDocument,
+    client_edit_version: u64,
+    session_token: &str,
+) -> Result<recovery_db::SnapshotAck, String> {
+    db.write_clean_checkpoint_for_session(
+        root,
+        &relative_string(&document.relative_path),
+        document.identity,
+        document.write_revision,
+        client_edit_version,
+        document.baseline_hash.clone(),
+        session_token,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct CompletedDocumentSave {
+    file_identity: FileIdentity,
+    write_revision: u64,
+    baseline_hash: String,
+}
+
+/// Performs all document filesystem work from an immutable authorization
+/// snapshot. This function must not receive ProjectAuthority (or a borrowed
+/// ActiveProject), which is the mechanical guard against future lock inversion.
+fn persist_document_snapshot(
+    snapshot: &AuthorizationSnapshot,
+    revision: u64,
+    content: &str,
+) -> Result<CompletedDocumentSave, String> {
+    let document_id = snapshot
+        .document_id
+        .ok_or_else(|| "Save requires a document authorization".to_string())?;
+    let relative = snapshot
+        .relative_path
+        .as_ref()
+        .ok_or_else(|| "Save requires a document path".to_string())?;
+    let previous_revision = snapshot
+        .write_revision
+        .ok_or_else(|| "Save requires a document revision".to_string())?;
+    let baseline = snapshot
+        .baseline_hash
+        .as_ref()
+        .ok_or_else(|| "Save requires a document baseline".to_string())?;
+    let expected_identity = snapshot
+        .file_identity
+        .ok_or_else(|| "Save requires a document file identity".to_string())?;
+    let _ = document_id; // Document binding is checked again by SQLite/apply.
+    if revision < previous_revision {
+        return Err("A newer document revision was already saved".into());
+    }
+    if revision == previous_revision {
+        return (baseline == &hash_content(content))
+            .then_some(CompletedDocumentSave {
+                file_identity: expected_identity,
+                write_revision: revision,
+                baseline_hash: baseline.clone(),
+            })
+            .ok_or_else(|| "A different document revision was already saved".to_string());
+    }
+    let (on_disk, identity) =
+        read_file_at(&snapshot.root_fd, relative).map_err(|error| format!("CONFLICT: {error}"))?;
+    if identity != expected_identity || hash_content(&on_disk) != *baseline {
+        return Err(
+            "CONFLICT: The file changed on disk; copy local text or discard and reload".into(),
+        );
+    }
+    let new_identity = write_file_at(
+        &snapshot.root_fd,
+        relative,
+        content,
+        Some(expected_identity),
+        false,
+    )?;
+    let (committed, final_identity) = read_file_at(&snapshot.root_fd, relative)?;
+    if final_identity != new_identity {
+        return Err("CONFLICT: File changed during save".into());
+    }
+    Ok(CompletedDocumentSave {
+        file_identity: new_identity,
+        write_revision: revision,
+        baseline_hash: hash_content(&committed),
+    })
+}
+
+/// The only post-I/O ProjectAuthority acquisition for normal saves. It compares
+/// the snapshot generation/revision before changing in-memory state.
+fn apply_document_save(
+    authority: &ProjectAuthority,
+    snapshot: &AuthorizationSnapshot,
+    completed: &CompletedDocumentSave,
+    content: String,
+) -> Result<AuthorityApply<DocumentDto>, String> {
+    let mut state = authority
+        .0
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?;
+    let Some(project) = state.project.as_mut() else {
+        return Ok(AuthorityApply::Stale);
+    };
+    let Some(document_id) = snapshot.document_id else {
+        return Ok(AuthorityApply::Stale);
+    };
+    let Some(document) = project.documents.get_mut(&document_id) else {
+        return Ok(AuthorityApply::Stale);
+    };
+    if project.identity != snapshot.project_id
+        || project.session_token != snapshot.session_token
+        || document.relative_path != snapshot.relative_path.clone().expect("document path")
+    {
+        return Ok(AuthorityApply::Stale);
+    }
+    // A response/acknowledgement-loss retry reaches here after the original
+    // compare/apply completed. Return the already-authoritative value rather
+    // than treating that ordinary idempotent retry as stale.
+    if document.write_revision == completed.write_revision
+        && document.file_identity == completed.file_identity
+        && document.baseline_hash == completed.baseline_hash
+    {
+        return Ok(AuthorityApply::Applied(DocumentDto {
+            project_id: project.identity,
+            document_id: Some(document.identity),
+            relative_path: Some(relative_string(&document.relative_path)),
+            content,
+            write_revision: document.write_revision,
+            baseline_hash: document.baseline_hash.clone(),
+            conflict: None,
+            recovery: None,
+        }));
+    }
+    if document.write_revision != snapshot.write_revision.expect("document revision")
+        || document.file_identity != snapshot.file_identity.expect("document identity")
+        || document.baseline_hash != *snapshot.baseline_hash.as_ref().expect("document baseline")
+    {
+        return Ok(AuthorityApply::Stale);
+    }
+    document.file_identity = completed.file_identity;
+    document.write_revision = completed.write_revision;
+    document.baseline_hash = completed.baseline_hash.clone();
+    let dto = DocumentDto {
+        project_id: project.identity,
+        document_id: Some(document.identity),
+        relative_path: Some(relative_string(&document.relative_path)),
+        content,
+        write_revision: document.write_revision,
+        baseline_hash: document.baseline_hash.clone(),
+        conflict: None,
+        recovery: None,
+    };
+    Ok(AuthorityApply::Applied(dto))
+}
+
+/// Journal-led completion after the webview has lost a SaveOutcome. The
+/// operation row was authenticated against the current session and disk before
+/// this function is called; this only advances an in-memory binding, never
+/// writes bytes. A newer in-memory revision is a stale operation and wins.
+fn apply_reconciled_document_save(
+    authority: &ProjectAuthority,
+    snapshot: &AuthorizationSnapshot,
+    operation: &recovery_db::SaveOperation,
+    completed: &CompletedDocumentSave,
+    content: String,
+) -> Result<AuthorityApply<DocumentDto>, String> {
+    let mut state = authority
+        .0
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?;
+    let Some(project) = state.project.as_mut() else {
+        return Ok(AuthorityApply::Stale);
+    };
+    if project.identity != snapshot.project_id || project.session_token != snapshot.session_token {
+        return Ok(AuthorityApply::Stale);
+    }
+    let Some(document) = project.documents.get_mut(&operation.document_id) else {
+        return Ok(AuthorityApply::Stale);
+    };
+    if document.relative_path != operation.relative_path
+        || document.write_revision > operation.write_revision
+    {
+        return Ok(AuthorityApply::Stale);
+    }
+    document.file_identity = completed.file_identity;
+    document.write_revision = operation.write_revision;
+    document.baseline_hash = completed.baseline_hash.clone();
+    Ok(AuthorityApply::Applied(DocumentDto {
+        project_id: project.identity,
+        document_id: Some(document.identity),
+        relative_path: Some(relative_string(&document.relative_path)),
+        content,
+        write_revision: document.write_revision,
+        baseline_hash: document.baseline_hash.clone(),
+        conflict: None,
+        recovery: None,
+    }))
+}
+
+/// Applies only a RecoveryDb-committed Save As transition.  The destination is
+/// intentionally absent from ProjectAuthority until this compare-and-apply
+/// step; a file write or SQLite failure can therefore never redirect the live
+/// editor away from its untitled source.
+#[allow(clippy::too_many_arguments)]
+fn apply_save_as_transition(
+    authority: &ProjectAuthority,
+    snapshot: &AuthorizationSnapshot,
+    relative_path: PathBuf,
+    document_id: u64,
+    file_identity: FileIdentity,
+    revision: u64,
+    content: String,
+) -> Result<AuthorityApply<DocumentDto>, String> {
+    let mut state = authority
+        .0
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?;
+    let Some(project) = state.project.as_ref() else {
+        return Ok(AuthorityApply::Stale);
+    };
+    if project.identity != snapshot.project_id
+        || project.session_token != snapshot.session_token
+        || project.paths.contains_key(&relative_path)
+    {
+        return Ok(AuthorityApply::Stale);
+    }
+    activate_document_with_identity(
+        &mut state,
+        relative_path,
+        document_id,
+        file_identity,
+        &content,
+        revision,
+    )?;
+    let project = state.project.as_ref().expect("project remains active");
+    let document = project
+        .documents
+        .get(&document_id)
+        .expect("registered document");
+    Ok(AuthorityApply::Applied(document_dto(
+        project, document, content,
+    )))
+}
+
+fn checkpoint_completed_save(
+    db: &RecoveryDb,
+    snapshot: &AuthorizationSnapshot,
+    completed: &CompletedDocumentSave,
+    client_edit_version: u64,
+) -> Result<recovery_db::SnapshotAck, String> {
+    db.write_clean_checkpoint_for_session(
+        &snapshot.root.display().to_string(),
+        &relative_string(snapshot.relative_path.as_ref().expect("document path")),
+        snapshot.document_id.expect("document id"),
+        completed.write_revision,
+        client_edit_version,
+        completed.baseline_hash.clone(),
+        &snapshot.session_token,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_outcome(
+    snapshot: &AuthorizationSnapshot,
+    operation_key: String,
+    completed: &CompletedDocumentSave,
+    client_edit_version: u64,
+    checkpoint: bool,
+    selector: bool,
+    document: Option<DocumentDto>,
+    error: Option<(&str, String)>,
+) -> SaveOutcome {
+    SaveOutcome {
+        file_committed: true,
+        recovery_checkpoint_durable: checkpoint,
+        selector_session_state_durable: selector,
+        reconciliation_pending: !checkpoint || !selector,
+        reconciliation_error_code: error.as_ref().map(|(code, _)| (*code).to_string()),
+        reconciliation_error_message: error.map(|(_, message)| message.chars().take(240).collect()),
+        project_id: snapshot.project_id,
+        session_token: snapshot.session_token.clone(),
+        document_id: snapshot.document_id,
+        relative_path: snapshot
+            .relative_path
+            .as_ref()
+            .map(|path| relative_string(path)),
+        file_identity: Some(file_identity_text(completed.file_identity)),
+        write_revision: completed.write_revision,
+        baseline_hash: completed.baseline_hash.clone(),
+        saved_client_edit_version: client_edit_version,
+        content_blake3: completed.baseline_hash.clone(),
+        operation_key,
+        document: document.map(Box::new),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1764,6 +2596,7 @@ fn render_markdown(markdown: String) -> String {
 async fn pick_project(
     app: AppHandle,
     authority: State<'_, ProjectAuthority>,
+    activation: State<'_, ActivationAuthority>,
 ) -> Result<Option<ProjectCandidateDto>, String> {
     let Some(selected) = app.dialog().file().blocking_pick_folder() else {
         return Ok(None);
@@ -1772,16 +2605,34 @@ async fn pick_project(
         .into_path()
         .map_err(|e| format!("Could not use selected project: {e}"))?;
     let root = canonical_project_root(&path)?;
+    // The native dialog and candidate validation deliberately happen before the
+    // gate. A picker must never make a slow user interaction block activation.
+    Ok(Some(publish_picked_project(&authority, &activation, root)?))
+}
+
+/// Publish an already validated picker result. The activation gate makes the
+/// candidate generation and replacement atomic with respect to every complete
+/// activation: a picker cannot replace the candidate after terminal discard
+/// and before the in-memory authority swap.
+fn publish_picked_project(
+    authority: &ProjectAuthority,
+    activation: &ActivationAuthority,
+    root: PathBuf,
+) -> Result<ProjectCandidateDto, String> {
+    let _activation = activation
+        .0
+        .lock()
+        .map_err(|_| "Project activation state is unavailable".to_string())?;
     let mut state = authority
         .0
         .lock()
         .map_err(|_| "Project state is unavailable".to_string())?;
     let candidate_id = ProjectAuthority::next_id(&mut state);
     state.pending_project = Some((candidate_id, root.clone()));
-    Ok(Some(ProjectCandidateDto {
+    Ok(ProjectCandidateDto {
         candidate_id,
         root: root.display().to_string(),
-    }))
+    })
 }
 
 #[tauri::command]
@@ -1789,44 +2640,230 @@ fn activate_picked_project(
     app: AppHandle,
     authority: State<'_, ProjectAuthority>,
     recovery: State<'_, RecoveryAuthority>,
+    activation: State<'_, ActivationAuthority>,
     candidate_id: u64,
     discard_previous_recovery: bool,
 ) -> Result<ProjectDto, String> {
-    let root = {
+    let _activation = activation
+        .0
+        .lock()
+        .map_err(|_| "Project activation state is unavailable".to_string())?;
+    // Snapshot candidate and old session under ProjectAuthority. No fallible
+    // filesystem or SQLite operation is permitted in this critical section.
+    let (root, identity, session_token, old_session) = {
         let mut state = authority
             .0
             .lock()
             .map_err(|_| "Project state is unavailable".to_string())?;
         let (id, root) = state
             .pending_project
-            .take()
+            .as_ref()
             .ok_or_else(|| "No project selection is pending".to_string())?;
-        if id != candidate_id {
+        if *id != candidate_id {
             return Err("The selected project is stale".into());
         }
-        root
+        let root = root.clone();
+        let identity = ProjectAuthority::next_id(&mut state);
+        let session_token = ProjectAuthority::session_token(&root, identity);
+        let old_session = state.project.as_ref().map(|project| {
+            (
+                project.identity,
+                project.root.display().to_string(),
+                project.session_token.clone(),
+            )
+        });
+        (root, identity, session_token, old_session)
     };
-    let previous = authority
-        .0
-        .lock()
-        .map_err(|_| "Project state is unavailable".to_string())?
-        .project
-        .as_ref()
-        .map(|project| project.root.display().to_string());
-    let project = authority.activate_project(root.clone())?;
-    ProjectStore::for_app(&app)?.write(&root, None)?;
-    // Discard is irreversible only after the candidate became the active
-    // project and its persisted project state was accepted.
-    if discard_previous_recovery {
-        if let Some(previous) = previous {
+    let root_fd = open_directory_path(&root)?;
+    let store = ProjectStore::for_app(&app)?;
+    let saved_state = store.state_bytes()?;
+    let next = ActiveProject {
+        root: root.clone(),
+        root_fd: Arc::new(root_fd),
+        identity,
+        session_token: session_token.clone(),
+        documents: HashMap::new(),
+        paths: HashMap::new(),
+    };
+    let next_root = root.display().to_string();
+    // The SQLite fence is the linearization point.  It must compare the exact
+    // old capability, rather than merely deactivating whichever row is current.
+    let transition = (|| {
+        let _transaction = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        let db = recovery_db_for_app(&app)?;
+        db.transition_active_session(
+            old_session
+                .as_ref()
+                .map(|(_, root, token)| (root.as_str(), token.as_str())),
+            &next_root,
+            &session_token,
+        )
+    })();
+    transition?;
+    // Selector persistence deliberately follows the token fence. If it fails,
+    // restore the SQLite session to the still-live authority before returning.
+    if let Err(error) = store.write(&root, None) {
+        let rollback = {
             let _transaction = recovery
                 .0
                 .lock()
                 .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-            RecoveryStore::for_root(&app, &previous)?.clear()?;
+            recovery_db_for_app(&app)?.rollback_activation_session(
+                old_session
+                    .as_ref()
+                    .map(|(_, root, token)| (root.as_str(), token.as_str())),
+                &next_root,
+                &session_token,
+            )
+        };
+        let _ = store.restore_state_bytes(saved_state.as_deref());
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; could not restore the live recovery session: {rollback_error}"
+            )),
+        };
+    }
+    // This is the last candidate/old-authority comparison. The activation gate
+    // excludes picker publication and every other activation until the final
+    // authority swap, so after terminal discard candidate identity can no
+    // longer change underneath this request.
+    {
+        let state = authority
+            .0
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())?;
+        let unchanged = state
+            .pending_project
+            .as_ref()
+            .is_some_and(|(id, pending)| *id == candidate_id && *pending == root)
+            && state.project.as_ref().map(|project| project.identity)
+                == old_session.as_ref().map(|session| session.0);
+        if !unchanged {
+            return Err("STALE_COMPLETION: project changed during activation".into());
         }
     }
+    // Discard is intentionally after selector persistence but before the
+    // authority swap. The transition above is its successful old-token CAS;
+    // this final step cannot discard data on a stale activation request.
+    if discard_previous_recovery {
+        let discard = {
+            let _transaction = recovery
+                .0
+                .lock()
+                .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+            recovery_db_for_app(&app)?.finalize_activation_discard(
+                old_session
+                    .as_ref()
+                    .map(|(_, root, token)| (root.as_str(), token.as_str())),
+                &next_root,
+                &session_token,
+            )
+        };
+        if let Err(error) = discard {
+            let rollback = {
+                let _transaction = recovery
+                    .0
+                    .lock()
+                    .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+                recovery_db_for_app(&app)?.rollback_activation_session(
+                    old_session
+                        .as_ref()
+                        .map(|(_, root, token)| (root.as_str(), token.as_str())),
+                    &next_root,
+                    &session_token,
+                )
+            };
+            let _ = store.restore_state_bytes(saved_state.as_deref());
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(format!(
+                    "{error}; could not restore the live recovery session: {rollback_error}"
+                )),
+            };
+        }
+    }
+    let mut state = authority
+        .0
+        .lock()
+        .map_err(|_| "Project state is unavailable".to_string())?;
+    // No fallible candidate comparison is allowed after terminal discard. The
+    // activation gate retained above guarantees this is still our candidate.
+    state.pending_project.take();
+    state.project = Some(next);
+    let project = ProjectDto {
+        project_id: identity,
+        root: next_root,
+        session_token: session_token.clone(),
+    };
+    drop(state);
+    // The one-use CAS proof is only required to authorize the discard. Do not
+    // retain an event for ordinary switches after the authority is published.
+    if !discard_previous_recovery {
+        let _transaction = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        let _ = recovery_db_for_app(&app)?.clear_activation_cas(
+            old_session
+                .as_ref()
+                .map(|(_, root, token)| (root.as_str(), token.as_str())),
+            &session_token,
+        );
+    }
     Ok(project)
+}
+
+/// Runs every fallible activation step while the old authority is still live.
+/// The sole swap is last, so an error preserves all old document IDs and their
+/// recovery binding. `rollback` restores the persisted selector if discard
+/// preparation failed after the new selector was staged.
+fn commit_project_activation<P, D, R>(
+    state: &mut ProjectState,
+    candidate_id: u64,
+    next: ActiveProject,
+    persist_new: P,
+    discard_previous: D,
+    rollback: R,
+) -> Result<ProjectDto, String>
+where
+    P: FnOnce() -> Result<(), String>,
+    D: FnOnce(&ActiveProject) -> Result<(), String>,
+    R: FnOnce() -> Result<(), String>,
+{
+    match state.pending_project.as_ref() {
+        Some((id, root)) if *id == candidate_id && *root == next.root => {}
+        _ => return Err("The selected project is stale".into()),
+    }
+    persist_new()?;
+    if let Some(previous) = state.project.as_ref() {
+        if let Err(error) = discard_previous(previous) {
+            return match rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(format!(
+                    "{error}; old session remains active but restoring the project selector failed: {rollback_error}"
+                )),
+            };
+        }
+    }
+    state.pending_project.take();
+    let project_id = next.identity;
+    let root = next.root.display().to_string();
+    state.project = Some(next);
+    let session_token = state
+        .project
+        .as_ref()
+        .expect("activated project")
+        .session_token
+        .clone();
+    Ok(ProjectDto {
+        project_id,
+        root,
+        session_token,
+    })
 }
 
 #[tauri::command]
@@ -1852,11 +2889,15 @@ fn list_project_directory(
 
 #[tauri::command]
 fn open_project_document(
+    app: AppHandle,
     authority: State<'_, ProjectAuthority>,
+    recovery: State<'_, RecoveryAuthority>,
     project_id: u64,
     relative_path: String,
 ) -> Result<DocumentDto, String> {
     let relative = validate_relative(&relative_path, true)?;
+    let snapshot = capture_authorization_snapshot(&authority, project_id, None, None)?;
+    let (content, file_identity) = read_file_at(&snapshot.root_fd, &relative)?;
     let mut state = authority
         .0
         .lock()
@@ -1865,14 +2906,21 @@ fn open_project_document(
         .project
         .as_ref()
         .ok_or_else(|| "No project is open".to_string())?;
-    if project.identity != project_id {
+    if project.identity != snapshot.project_id || project.session_token != snapshot.session_token {
         return Err("The project changed".into());
     }
-    let (content, file_identity) = read_file_at(&project.root_fd, &relative)?;
     let id = activate_document(&mut state, relative.clone(), file_identity, &content, 0)?;
     let project = state.project.as_ref().expect("project remains active");
     let document = project.documents.get(&id).expect("registered document");
-    Ok(document_dto(project, document, content))
+    let root = project.root.display().to_string();
+    let dto = document_dto(project, document, content);
+    drop(state);
+    let _guard = recovery
+        .0
+        .lock()
+        .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+    recovery_db_for_app(&app)?.rebind_session_binding(&root, &relative_string(&relative), id)?;
+    Ok(dto)
 }
 
 #[tauri::command]
@@ -1900,57 +2948,556 @@ fn select_project_document(
     ProjectStore::for_app(&app)?.write(&project.root, Some(&document.relative_path))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_active(
     app: &AppHandle,
     authority: &ProjectAuthority,
+    recovery: &RecoveryAuthority,
     project_id: u64,
+    session_token: &str,
     document_id: u64,
     revision: u64,
+    client_edit_version: u64,
     content: &str,
-) -> Result<DocumentDto, String> {
-    let mut state = authority
-        .0
-        .lock()
-        .map_err(|_| "Project state is unavailable".to_string())?;
-    let project = state
-        .project
-        .as_ref()
-        .ok_or_else(|| "No project is open".to_string())?;
-    if project.identity != project_id {
-        return Err("The project changed before save".into());
-    }
-    write_document_revision(
-        state.project.as_mut().expect("project"),
-        document_id,
-        revision,
-        content,
+) -> Result<SaveOutcome, String> {
+    let snapshot = capture_authorization_snapshot(
+        authority,
+        project_id,
+        Some(session_token),
+        Some(document_id),
     )?;
-    let project = state.project.as_ref().expect("project");
-    let document = project
-        .documents
-        .get(&document_id)
-        .expect("registered document");
-    ProjectStore::for_app(app)?.write(&project.root, Some(&document.relative_path))?;
-    Ok(document_dto(project, document, content.into()))
+    let relative = snapshot.relative_path.as_ref().expect("document path");
+    let content_hash = hash_content(content);
+    let operation_key = save_operation_key(
+        &snapshot,
+        &snapshot.document_id.expect("document id").to_string(),
+        &relative_string(relative),
+        revision,
+        client_edit_version,
+        &content_hash,
+    );
+
+    // A retry checks the operation record before it attempts any replacement.
+    // This is necessary after process restart: the in-memory baseline may still
+    // be old even though the prior process already renamed the new bytes.
+    let prior = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(app)?.save_operation(
+            &snapshot.root.display().to_string(),
+            &snapshot.session_token,
+            &operation_key,
+        )?
+    };
+    let completed = if let Some(prior) = prior {
+        let (disk, identity) = read_file_at(&snapshot.root_fd, relative)?;
+        if hash_content(&disk) != prior.content_blake3
+            || file_identity_text(identity) != prior.file_identity
+        {
+            // The bytes were once committed but their durable record is no
+            // longer safe to apply. Do not overwrite a potentially newer file.
+            return Ok(save_outcome(&snapshot, operation_key, &CompletedDocumentSave { file_identity: identity, write_revision: prior.write_revision, baseline_hash: hash_content(&disk) }, client_edit_version, prior.recovery_checkpoint_durable, prior.selector_durable, None, Some(("AMBIGUOUS_DISK_STATE", "A prior save was recorded but disk bytes no longer match; recovery requires user action".into()))));
+        }
+        CompletedDocumentSave {
+            file_identity: identity,
+            write_revision: prior.write_revision,
+            baseline_hash: prior.content_blake3,
+        }
+    } else {
+        // A killed process can die between rename and the SQLite journal. Exact
+        // requested bytes on a replacement inode are preserved as an explicit
+        // ambiguity, never overwritten on a retry.
+        let (disk, identity) = read_file_at(&snapshot.root_fd, relative)?;
+        if hash_content(&disk) == content_hash
+            && snapshot
+                .file_identity
+                .is_some_and(|expected| expected != identity)
+        {
+            return Ok(save_outcome(
+                &snapshot,
+                operation_key,
+                &CompletedDocumentSave {
+                    file_identity: identity,
+                    write_revision: revision,
+                    baseline_hash: content_hash,
+                },
+                client_edit_version,
+                false,
+                false,
+                None,
+                Some(("AMBIGUOUS_COMMIT_JOURNAL", "Disk has the exact requested bytes but the post-rename operation record is absent; reconciliation will not overwrite it".into())),
+            ));
+        }
+        persist_document_snapshot(&snapshot, revision, content)?
+    };
+
+    // The replacement inode is visible but has no durable operation evidence
+    // yet. A real kill here is deliberately treated as ambiguous on retry.
+    if let Err(error) = fail_save_outcome_at(SaveOutcomeFault::RenameBeforeOperationJournal) {
+        return Ok(save_outcome(
+            &snapshot,
+            operation_key,
+            &completed,
+            client_edit_version,
+            false,
+            false,
+            None,
+            Some(("OPERATION_JOURNAL_PENDING", error)),
+        ));
+    }
+
+    // The rename has happened. From this point this command returns a
+    // SaveOutcome rather than an ordinary error (aside from response transport
+    // loss), so callers never falsely report the manuscript as unsaved.
+    let operation = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(app).and_then(|db| {
+            db.record_file_commit(
+                &snapshot.root.display().to_string(),
+                &snapshot.session_token,
+                &operation_key,
+                &relative_string(relative),
+                &relative_string(relative),
+                snapshot.document_id.expect("document id"),
+                completed.write_revision,
+                client_edit_version,
+                &completed.baseline_hash,
+                &file_identity_text(completed.file_identity),
+            )
+        })
+    };
+    let mut operation = match operation {
+        Ok(operation) => operation,
+        Err(error) => {
+            return Ok(save_outcome(
+                &snapshot,
+                operation_key,
+                &completed,
+                client_edit_version,
+                false,
+                false,
+                None,
+                Some(("OPERATION_JOURNAL_PENDING", error)),
+            ));
+        }
+    };
+    if let Err(error) = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(app).and_then(|db| {
+            db.mark_save_operation_pending_metadata(
+                &snapshot.root.display().to_string(),
+                &snapshot.session_token,
+                &operation_key,
+            )
+        })
+    } {
+        return Ok(save_outcome(
+            &snapshot,
+            operation_key,
+            &completed,
+            client_edit_version,
+            false,
+            false,
+            None,
+            Some(("RECOVERY_METADATA_PENDING", error)),
+        ));
+    }
+    if let Err(error) = fail_save_outcome_at(SaveOutcomeFault::OperationJournalBeforeCheckpoint) {
+        return Ok(save_outcome(
+            &snapshot,
+            operation_key,
+            &completed,
+            client_edit_version,
+            false,
+            operation.selector_durable,
+            None,
+            Some(("RECOVERY_CHECKPOINT_PENDING", error)),
+        ));
+    }
+    if !operation.recovery_checkpoint_durable {
+        let checkpoint = {
+            let _guard = recovery
+                .0
+                .lock()
+                .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+            recovery_db_for_app(app).and_then(|db| {
+                db.reconcile_save_checkpoint(
+                    &snapshot.root.display().to_string(),
+                    &snapshot.session_token,
+                    &operation_key,
+                    &operation.relative_path,
+                    operation.document_id,
+                    operation.write_revision,
+                    operation.client_edit_version,
+                    completed.baseline_hash.clone(),
+                )
+            })
+        };
+        operation = match checkpoint {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(save_outcome(
+                    &snapshot,
+                    operation_key,
+                    &completed,
+                    client_edit_version,
+                    false,
+                    operation.selector_durable,
+                    None,
+                    Some(("RECOVERY_CHECKPOINT_PENDING", error)),
+                ));
+            }
+        };
+    }
+    if let Err(error) = fail_save_outcome_at(SaveOutcomeFault::CheckpointBeforeSelector) {
+        return Ok(save_outcome(
+            &snapshot,
+            operation_key,
+            &completed,
+            client_edit_version,
+            true,
+            operation.selector_durable,
+            None,
+            Some(("SELECTOR_PENDING", error)),
+        ));
+    }
+    // Do not carry RecoveryAuthority into ProjectAuthority. The compare/apply
+    // below is deliberately after the transaction guard is released.
+    let document = match apply_document_save(authority, &snapshot, &completed, content.into())? {
+        AuthorityApply::Applied(document) => document,
+        AuthorityApply::Stale => return Ok(save_outcome(&snapshot, operation_key, &completed, client_edit_version, true, operation.selector_durable, None, Some(("SESSION_STATE_PENDING", "File and recovery checkpoint committed; the active project changed before acknowledgement".into())))),
+    };
+    if !operation.selector_durable {
+        if let Err(error) = ProjectStore::for_app(app)
+            .and_then(|store| store.write(&snapshot.root, snapshot.relative_path.as_deref()))
+        {
+            return Ok(save_outcome(
+                &snapshot,
+                operation_key,
+                &completed,
+                client_edit_version,
+                true,
+                false,
+                Some(document),
+                Some(("SELECTOR_PENDING", error)),
+            ));
+        }
+        let selector = {
+            let _guard = recovery
+                .0
+                .lock()
+                .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+            recovery_db_for_app(app).and_then(|db| {
+                db.mark_save_selector_durable(
+                    &snapshot.root.display().to_string(),
+                    &snapshot.session_token,
+                    &operation_key,
+                )
+            })
+        };
+        operation = match selector {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(save_outcome(
+                    &snapshot,
+                    operation_key,
+                    &completed,
+                    client_edit_version,
+                    true,
+                    false,
+                    Some(document),
+                    Some(("SELECTOR_JOURNAL_PENDING", error)),
+                ));
+            }
+        };
+    }
+    // Retain restart metadata until the response boundary has passed. The
+    // destructive child test aborts at this exact durable point.
+    fail_save_outcome_at(SaveOutcomeFault::SelectorBeforeResponse)?;
+    let _ = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(app).and_then(|db| {
+            db.clear_save_operation_pending_metadata(
+                &snapshot.root.display().to_string(),
+                &snapshot.session_token,
+                &operation_key,
+            )
+        })
+    };
+    Ok(save_outcome(
+        &snapshot,
+        operation_key,
+        &completed,
+        client_edit_version,
+        true,
+        operation.selector_durable,
+        Some(document),
+        None,
+    ))
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn save_document(
     app: AppHandle,
     authority: State<'_, ProjectAuthority>,
+    recovery: State<'_, RecoveryAuthority>,
     project_id: u64,
+    session_token: String,
     document_id: u64,
     revision: u64,
+    client_edit_version: u64,
     content: String,
-) -> Result<DocumentDto, String> {
+) -> Result<SaveOutcome, String> {
     save_active(
         &app,
         &authority,
+        &recovery,
         project_id,
+        &session_token,
         document_id,
         revision,
+        client_edit_version,
         &content,
     )
+}
+
+/// Reconcile a previously committed save without accepting a path, content,
+/// picker result, revision, or document id from the webview. The opaque key is
+/// meaningful only with the currently active project/session capability.
+#[tauri::command]
+fn reconcile_save_operation(
+    app: AppHandle,
+    authority: State<'_, ProjectAuthority>,
+    recovery: State<'_, RecoveryAuthority>,
+    project_id: u64,
+    session_token: String,
+    operation_key: String,
+) -> Result<SaveOutcome, String> {
+    if !valid_blake3_hex(&operation_key) {
+        return Err("Save reconciliation operation key is invalid".into());
+    }
+    let snapshot =
+        capture_authorization_snapshot(&authority, project_id, Some(&session_token), None)?;
+    let root = snapshot.root.display().to_string();
+    let mut operation = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(&app)?.save_operation(&root, &snapshot.session_token, &operation_key)?
+    }
+    .ok_or_else(|| {
+        "Save reconciliation operation is unknown, stale, or belongs to another project".to_string()
+    })?;
+    let relative = validate_relative(&operation.relative_path, true)?;
+    if operation.document_id == 0
+        || operation.write_revision == 0
+        || operation.client_edit_version == 0
+        || !valid_blake3_hex(&operation.content_blake3)
+    {
+        return Err("Save reconciliation journal is invalid".into());
+    }
+    if operation.source_key != "__untitled__" && operation.source_key != operation.relative_path {
+        return Err("Save reconciliation source/destination journal is invalid".into());
+    }
+    let (content, identity) =
+        read_file_at(&snapshot.root_fd, &relative).map_err(|error| format!("CONFLICT: {error}"))?;
+    if hash_content(&content) != operation.content_blake3
+        || file_identity_text(identity) != operation.file_identity
+    {
+        return Err("CONFLICT: The committed file changed on disk before reconciliation".into());
+    }
+    let completed = CompletedDocumentSave {
+        file_identity: identity,
+        write_revision: operation.write_revision,
+        baseline_hash: operation.content_blake3.clone(),
+    };
+    let destination_state = {
+        let state = authority
+            .0
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())?;
+        state.project.as_ref().and_then(|project| {
+            if project.identity != snapshot.project_id
+                || project.session_token != snapshot.session_token
+            {
+                return None;
+            }
+            project
+                .documents
+                .get(&operation.document_id)
+                .map(|document| {
+                    document.relative_path == relative
+                        && document.write_revision <= operation.write_revision
+                })
+        })
+    };
+    let document = if destination_state == Some(true) {
+        match apply_reconciled_document_save(
+            &authority,
+            &snapshot,
+            &operation,
+            &completed,
+            content.clone(),
+        )? {
+            AuthorityApply::Applied(document) => document,
+            AuthorityApply::Stale => {
+                return Err("Save reconciliation is stale for the active document".into());
+            }
+        }
+    } else {
+        if destination_state == Some(false) || operation.source_key != "__untitled__" {
+            return Err("Save reconciliation is stale for the active document".into());
+        }
+        let transition = {
+            let _guard = recovery
+                .0
+                .lock()
+                .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+            recovery_db_for_app(&app)?.reconcile_save_as_operation(
+                &root,
+                &snapshot.session_token,
+                &operation_key,
+            )?
+        };
+        if transition.destination_document_id != operation.document_id {
+            return Err("Save As reconciliation destination is stale".into());
+        }
+        match apply_save_as_transition(
+            &authority,
+            &snapshot,
+            relative.clone(),
+            operation.document_id,
+            identity,
+            operation.write_revision,
+            content.clone(),
+        )? {
+            AuthorityApply::Applied(document) => document,
+            AuthorityApply::Stale => {
+                return Err("Save As reconciliation is stale for the active project".into());
+            }
+        }
+    };
+    if !operation.recovery_checkpoint_durable {
+        let checkpoint = {
+            let _guard = recovery
+                .0
+                .lock()
+                .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+            recovery_db_for_app(&app)?.reconcile_save_checkpoint(
+                &root,
+                &snapshot.session_token,
+                &operation_key,
+                &operation.relative_path,
+                operation.document_id,
+                operation.write_revision,
+                operation.client_edit_version,
+                operation.content_blake3.clone(),
+            )
+        };
+        operation = match checkpoint {
+            Ok(operation) => operation,
+            Err(error) => {
+                let mut outcome_snapshot = snapshot.clone();
+                outcome_snapshot.document_id = Some(operation.document_id);
+                outcome_snapshot.relative_path = Some(relative.clone());
+                return Ok(save_outcome(
+                    &outcome_snapshot,
+                    operation_key,
+                    &completed,
+                    operation.client_edit_version,
+                    false,
+                    operation.selector_durable,
+                    Some(document),
+                    Some(("RECOVERY_CHECKPOINT_PENDING", error)),
+                ));
+            }
+        };
+    }
+    if !operation.selector_durable {
+        if let Err(error) = ProjectStore::for_app(&app)
+            .and_then(|store| store.write(&snapshot.root, Some(&relative)))
+        {
+            let mut outcome_snapshot = snapshot.clone();
+            outcome_snapshot.document_id = Some(operation.document_id);
+            outcome_snapshot.relative_path = Some(relative.clone());
+            return Ok(save_outcome(
+                &outcome_snapshot,
+                operation_key,
+                &completed,
+                operation.client_edit_version,
+                true,
+                false,
+                Some(document),
+                Some(("SELECTOR_PENDING", error)),
+            ));
+        }
+        let selector = {
+            let _guard = recovery
+                .0
+                .lock()
+                .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+            recovery_db_for_app(&app)?.mark_save_selector_durable(
+                &root,
+                &snapshot.session_token,
+                &operation_key,
+            )
+        };
+        operation = match selector {
+            Ok(operation) => operation,
+            Err(error) => {
+                let mut outcome_snapshot = snapshot.clone();
+                outcome_snapshot.document_id = Some(operation.document_id);
+                outcome_snapshot.relative_path = Some(relative.clone());
+                return Ok(save_outcome(
+                    &outcome_snapshot,
+                    operation_key,
+                    &completed,
+                    operation.client_edit_version,
+                    true,
+                    false,
+                    Some(document),
+                    Some(("SELECTOR_JOURNAL_PENDING", error)),
+                ));
+            }
+        };
+    }
+    let _ = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(&app)?.clear_save_operation_pending_metadata(
+            &root,
+            &snapshot.session_token,
+            &operation_key,
+        )
+    };
+    let mut outcome_snapshot = snapshot;
+    outcome_snapshot.document_id = Some(operation.document_id);
+    outcome_snapshot.relative_path = Some(relative);
+    Ok(save_outcome(
+        &outcome_snapshot,
+        operation_key,
+        &completed,
+        operation.client_edit_version,
+        true,
+        operation.selector_durable,
+        Some(document),
+        None,
+    ))
 }
 
 fn picker_target_relative(root: &Path, selected: &Path) -> Result<PathBuf, String> {
@@ -1982,28 +3529,66 @@ fn picker_target_relative(root: &Path, selected: &Path) -> Result<PathBuf, Strin
     Ok(relative)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn save_as_outcome(
+    snapshot: &AuthorizationSnapshot,
+    relative: &Path,
+    file_identity: FileIdentity,
+    revision: u64,
+    client_edit_version: u64,
+    content_hash: String,
+    operation_key: String,
+    document_id: Option<u64>,
+    checkpoint: bool,
+    selector: bool,
+    document: Option<DocumentDto>,
+    error: Option<(&str, String)>,
+) -> SaveOutcome {
+    SaveOutcome {
+        file_committed: true,
+        recovery_checkpoint_durable: checkpoint,
+        selector_session_state_durable: selector,
+        reconciliation_pending: !checkpoint || !selector,
+        reconciliation_error_code: error.as_ref().map(|(code, _)| (*code).into()),
+        reconciliation_error_message: error.map(|(_, message)| message.chars().take(240).collect()),
+        project_id: snapshot.project_id,
+        session_token: snapshot.session_token.clone(),
+        document_id,
+        relative_path: Some(relative_string(relative)),
+        file_identity: Some(file_identity_text(file_identity)),
+        write_revision: revision,
+        baseline_hash: content_hash.clone(),
+        saved_client_edit_version: client_edit_version,
+        content_blake3: content_hash,
+        operation_key,
+        document: document.map(Box::new),
+    }
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn save_document_as(
     app: AppHandle,
     authority: State<'_, ProjectAuthority>,
+    recovery: State<'_, RecoveryAuthority>,
     project_id: u64,
+    session_token: String,
     revision: u64,
+    client_edit_version: u64,
     content: String,
-) -> Result<Option<DocumentDto>, String> {
-    let root = {
-        let state = authority
-            .0
-            .lock()
-            .map_err(|_| "Project state is unavailable".to_string())?;
-        let project = state
-            .project
-            .as_ref()
-            .ok_or_else(|| "No project is open".to_string())?;
-        if project.identity != project_id {
-            return Err("The project changed before Save As".into());
-        }
-        project.root.clone()
-    };
+    source_recovery: RecoveryWriteRequest,
+) -> Result<Option<SaveOutcome>, String> {
+    let source_recovery = into_dirty_recovery_request(source_recovery)?;
+    if source_recovery.relative_path.is_some()
+        || source_recovery.document_id.is_some()
+        || source_recovery.client_edit_version != client_edit_version
+        || source_recovery.content.as_deref() != Some(content.as_str())
+    {
+        return Err("Save As recovery source no longer matches the editor snapshot".into());
+    }
+    let project_snapshot =
+        capture_authorization_snapshot(&authority, project_id, Some(&session_token), None)?;
+    let root = project_snapshot.root.clone();
     let Some(selected) = app
         .dialog()
         .file()
@@ -2018,62 +3603,373 @@ async fn save_document_as(
         .into_path()
         .map_err(|e| format!("Could not use Save As target: {e}"))?;
     let relative = picker_target_relative(&root, &target)?;
-    let mut state = authority
+    // Filesystem writes use the immutable snapshot; no authority lock survives
+    // the dialog, canonicalization, or staged write.
+    let file_identity = write_file_at(&project_snapshot.root_fd, &relative, &content, None, true)?;
+    // Reserve an opaque ID but do not bind it into ProjectAuthority. The
+    // RecoveryDb transaction below owns the authority transfer; this keeps the
+    // untitled source live if a failure occurs after the filesystem rename.
+    let document_identity = {
+        let mut state = authority
+            .0
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())?;
+        let project = state
+            .project
+            .as_ref()
+            .ok_or_else(|| "No project is open".to_string())?;
+        if project.identity != project_snapshot.project_id
+            || project.session_token != project_snapshot.session_token
+            || project.root != root
+            || project.paths.contains_key(&relative)
+        {
+            return Ok(Some(save_as_outcome(&project_snapshot, &relative, file_identity, revision, client_edit_version, hash_content(&content), "unrecorded-save-as".into(), None, false, false, None, Some(("SESSION_STATE_PENDING", "File bytes were committed, but the project changed before Save As could reconcile".into())))));
+        }
+        ProjectAuthority::next_id(&mut state)
+    };
+    let root_text = project_snapshot.root.display().to_string();
+    let baseline_hash = hash_content(&content);
+    let operation_key = save_operation_key(
+        &project_snapshot,
+        "__untitled__",
+        &relative_string(&relative),
+        revision,
+        client_edit_version,
+        &baseline_hash,
+    );
+    if let Err(error) = fail_save_outcome_at(SaveOutcomeFault::RenameBeforeOperationJournal) {
+        return Ok(Some(save_as_outcome(
+            &project_snapshot,
+            &relative,
+            file_identity,
+            revision,
+            client_edit_version,
+            baseline_hash,
+            operation_key,
+            Some(document_identity),
+            false,
+            false,
+            None,
+            Some(("OPERATION_JOURNAL_PENDING", error)),
+        )));
+    }
+    // Save As uses the same post-rename journal as every other path. The
+    // source/destination tuple is embedded in the operation key; the recovery
+    // transition below remains the authority transfer for the untitled buffer.
+    let operation = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(&app).and_then(|db| {
+            db.record_file_commit(
+                &root_text,
+                &project_snapshot.session_token,
+                &operation_key,
+                "__untitled__",
+                &relative_string(&relative),
+                document_identity,
+                revision,
+                client_edit_version,
+                &baseline_hash,
+                &file_identity_text(file_identity),
+            )
+        })
+    };
+    let mut operation = match operation {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Some(save_as_outcome(
+                &project_snapshot,
+                &relative,
+                file_identity,
+                revision,
+                client_edit_version,
+                baseline_hash,
+                operation_key,
+                Some(document_identity),
+                false,
+                false,
+                None,
+                Some(("OPERATION_JOURNAL_PENDING", error)),
+            )));
+        }
+    };
+    if let Err(error) = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(&app).and_then(|db| {
+            db.mark_save_operation_pending_metadata(
+                &root_text,
+                &project_snapshot.session_token,
+                &operation_key,
+            )
+        })
+    } {
+        return Ok(Some(save_as_outcome(
+            &project_snapshot,
+            &relative,
+            file_identity,
+            revision,
+            client_edit_version,
+            baseline_hash,
+            operation_key,
+            Some(document_identity),
+            false,
+            false,
+            None,
+            Some(("RECOVERY_METADATA_PENDING", error)),
+        )));
+    }
+    if let Err(error) = fail_save_outcome_at(SaveOutcomeFault::OperationJournalBeforeCheckpoint) {
+        return Ok(Some(save_as_outcome(
+            &project_snapshot,
+            &relative,
+            file_identity,
+            revision,
+            client_edit_version,
+            baseline_hash,
+            operation_key,
+            Some(document_identity),
+            false,
+            operation.selector_durable,
+            None,
+            Some(("RECOVERY_CHECKPOINT_PENDING", error)),
+        )));
+    }
+    let _guard = recovery
         .0
         .lock()
-        .map_err(|_| "Project state is unavailable".to_string())?;
-    let project = state
-        .project
-        .as_ref()
-        .ok_or_else(|| "No project is open".to_string())?;
-    if project.identity != project_id
-        || project.root != root
-        || project.paths.contains_key(&relative)
-    {
-        return Err("Save As target is already authorized or project changed".into());
+        .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+    let transition = recovery_db_for_app(&app).and_then(|db| {
+        db.save_as_transition(
+            &root_text,
+            &project_snapshot.session_token,
+            &source_recovery,
+            &relative_string(&relative),
+            document_identity,
+            revision,
+            client_edit_version,
+            baseline_hash.clone(),
+        )
+    });
+    drop(_guard);
+    let transition = match transition {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Some(save_as_outcome(
+                &project_snapshot,
+                &relative,
+                file_identity,
+                revision,
+                client_edit_version,
+                baseline_hash,
+                operation_key,
+                Some(document_identity),
+                false,
+                operation.selector_durable,
+                None,
+                Some((
+                    "RECOVERY_CHECKPOINT_PENDING",
+                    format!(
+                        "File bytes were committed; Save As recovery reconciliation is pending: {error}"
+                    ),
+                )),
+            )));
+        }
+    };
+    operation = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        match recovery_db_for_app(&app).and_then(|db| {
+            db.reconcile_save_checkpoint(
+                &root_text,
+                &project_snapshot.session_token,
+                &operation_key,
+                &relative_string(&relative),
+                document_identity,
+                revision,
+                client_edit_version,
+                baseline_hash.clone(),
+            )
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Some(save_as_outcome(
+                    &project_snapshot,
+                    &relative,
+                    file_identity,
+                    revision,
+                    client_edit_version,
+                    baseline_hash,
+                    operation_key,
+                    Some(document_identity),
+                    false,
+                    operation.selector_durable,
+                    None,
+                    Some(("RECOVERY_CHECKPOINT_PENDING", error)),
+                )));
+            }
+        }
+    };
+    if let Err(error) = fail_save_outcome_at(SaveOutcomeFault::CheckpointBeforeSelector) {
+        return Ok(Some(save_as_outcome(
+            &project_snapshot,
+            &relative,
+            file_identity,
+            revision,
+            client_edit_version,
+            baseline_hash,
+            operation_key,
+            Some(document_identity),
+            true,
+            operation.selector_durable,
+            None,
+            Some(("SELECTOR_PENDING", error)),
+        )));
     }
-    let file_identity = write_file_at(&project.root_fd, &relative, &content, None, true)?;
-    let id = activate_document(
-        &mut state,
+    let applied = apply_save_as_transition(
+        &authority,
+        &project_snapshot,
         relative.clone(),
+        transition.destination_document_id,
         file_identity,
-        &content,
         revision,
+        content,
     )?;
-    let project = state.project.as_ref().expect("project");
-    let document = project.documents.get(&id).expect("document");
-    ProjectStore::for_app(&app)?.write(&project.root, Some(&relative))?;
-    Ok(Some(document_dto(project, document, content)))
+    let AuthorityApply::Applied(document) = applied else {
+        return Ok(Some(save_as_outcome(
+            &project_snapshot,
+            &relative,
+            file_identity,
+            revision,
+            client_edit_version,
+            baseline_hash,
+            operation_key,
+            Some(document_identity),
+            true,
+            operation.selector_durable,
+            None,
+            Some((
+                "SESSION_STATE_PENDING",
+                "Save As recovery committed, but the live project changed before acknowledgement"
+                    .into(),
+            )),
+        )));
+    };
+    if let Err(error) = ProjectStore::for_app(&app)
+        .and_then(|store| store.write(&project_snapshot.root, Some(&relative)))
+    {
+        return Ok(Some(save_as_outcome(
+            &project_snapshot,
+            &relative,
+            file_identity,
+            revision,
+            client_edit_version,
+            baseline_hash,
+            operation_key,
+            Some(document_identity),
+            true,
+            false,
+            Some(document),
+            Some((
+                "SELECTOR_PENDING",
+                format!(
+                    "Save As recovery committed, but selector metadata acknowledgement is pending: {error}"
+                ),
+            )),
+        )));
+    }
+    let selector = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(&app).and_then(|db| {
+            db.mark_save_selector_durable(
+                &root_text,
+                &project_snapshot.session_token,
+                &operation_key,
+            )
+        })
+    };
+    operation = match selector {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Some(save_as_outcome(
+                &project_snapshot,
+                &relative,
+                file_identity,
+                revision,
+                client_edit_version,
+                baseline_hash,
+                operation_key,
+                Some(document_identity),
+                true,
+                false,
+                Some(document),
+                Some(("SELECTOR_JOURNAL_PENDING", error)),
+            )));
+        }
+    };
+    fail_save_outcome_at(SaveOutcomeFault::SelectorBeforeResponse)?;
+    let _ = {
+        let _guard = recovery
+            .0
+            .lock()
+            .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+        recovery_db_for_app(&app).and_then(|db| {
+            db.clear_save_operation_pending_metadata(
+                &root_text,
+                &project_snapshot.session_token,
+                &operation_key,
+            )
+        })
+    };
+    Ok(Some(save_as_outcome(
+        &project_snapshot,
+        &relative,
+        file_identity,
+        revision,
+        client_edit_version,
+        baseline_hash,
+        operation_key,
+        Some(document_identity),
+        true,
+        operation.selector_durable,
+        Some(document),
+        None,
+    )))
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn autosave_document(
+    app: AppHandle,
     authority: State<'_, ProjectAuthority>,
+    recovery: State<'_, RecoveryAuthority>,
     project_id: u64,
+    session_token: String,
     document_id: u64,
     revision: u64,
+    client_edit_version: u64,
     content: String,
-) -> Result<DocumentDto, String> {
-    let mut state = authority
-        .0
-        .lock()
-        .map_err(|_| "Project state is unavailable".to_string())?;
-    let project = state
-        .project
-        .as_ref()
-        .ok_or_else(|| "No project is open".to_string())?;
-    if project.identity != project_id {
-        return Err("The project changed before autosave".into());
-    }
-    write_document_revision(
-        state.project.as_mut().expect("project"),
+) -> Result<SaveOutcome, String> {
+    save_active(
+        &app,
+        &authority,
+        &recovery,
+        project_id,
+        &session_token,
         document_id,
         revision,
+        client_edit_version,
         &content,
-    )?;
-    let project = state.project.as_ref().expect("project");
-    let document = project.documents.get(&document_id).expect("document");
-    Ok(document_dto(project, document, content))
+    )
 }
 
 fn restore_from_state(
@@ -2090,6 +3986,13 @@ fn restore_from_state(
     let mut active_relative_path = None;
     if let Some(raw_relative) = stored.relative_path {
         if let Ok(relative) = validate_relative(&raw_relative, true) {
+            let snapshot = capture_authorization_snapshot(
+                authority,
+                project.project_id,
+                Some(&project.session_token),
+                None,
+            )?;
+            let loaded = read_file_at(&snapshot.root_fd, &relative);
             let mut state = authority
                 .0
                 .lock()
@@ -2098,7 +4001,12 @@ fn restore_from_state(
                 .project
                 .as_ref()
                 .ok_or_else(|| "No project is open".to_string())?;
-            if let Ok((content, file_identity)) = read_file_at(&active_project.root_fd, &relative) {
+            if active_project.identity != snapshot.project_id
+                || active_project.session_token != snapshot.session_token
+            {
+                return Ok(None);
+            }
+            if let Ok((content, file_identity)) = loaded {
                 let id =
                     activate_document(&mut state, relative.clone(), file_identity, &content, 0)?;
                 let active_project = state.project.as_ref().expect("project");
@@ -2181,6 +4089,19 @@ fn restore_recovery(
         }
     }
     let project = authority.activate_project(root.clone())?;
+    let historical_max = manifest
+        .buffers
+        .iter()
+        .filter_map(|buffer| buffer.document_id)
+        .max()
+        .unwrap_or(0);
+    if historical_max != 0 {
+        let mut state = authority
+            .0
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())?;
+        state.next_identity = state.next_identity.max(historical_max);
+    }
     let mut documents = Vec::new();
     for mut metadata in manifest.buffers {
         let relative = metadata
@@ -2353,6 +4274,10 @@ fn restore_recovery(
                 .document_id
                 .expect("validated manifest document ID"),
         )?;
+        metadata.document_id = Some(id);
+        if let Some(entry) = recovered.as_mut() {
+            entry.document_id = Some(id);
+        }
         if conflict.is_some() {
             // Missing/invalid dirty baselines must never inherit the current
             // disk baseline. An empty stored baseline forces document_status
@@ -2379,34 +4304,296 @@ fn restore_recovery(
     }))
 }
 
+/// Rehydrates V2 rows only after the SQLite integrity check completed. Dirty
+/// content remains authoritative; clean snapshots carry UI metadata only and
+/// are safely rebased to a descriptor-bound disk read.
+fn restore_recovery_v2(
+    authority: &ProjectAuthority,
+    root: &Path,
+    recovered: recovery_db::RestoredRecovery,
+    pending_operations: &[recovery_db::SaveOperation],
+) -> Result<RestoreDto, String> {
+    let project = authority.activate_project(root.to_path_buf())?;
+    let snapshot = capture_authorization_snapshot(
+        authority,
+        project.project_id,
+        Some(&project.session_token),
+        None,
+    )?;
+    // A new process can otherwise allocate the same small integer that was
+    // persisted by its predecessor (for example, old ID 2 after new project
+    // ID 1). Reserve every historical ID before issuing any restored document
+    // authority, so none can be returned as a current capability.
+    let historical_max = recovered
+        .buffers
+        .iter()
+        .filter_map(|buffer| buffer.document_id)
+        .max()
+        .unwrap_or(0);
+    if historical_max != 0 {
+        let mut state = authority
+            .0
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())?;
+        if state.project.as_ref().is_none_or(|active| {
+            active.identity != snapshot.project_id || active.session_token != snapshot.session_token
+        }) {
+            return Err("STALE_COMPLETION: project changed during recovery restore".into());
+        }
+        state.next_identity = state.next_identity.max(historical_max);
+    }
+    let mut documents = Vec::new();
+    for mut buffer in recovered.buffers {
+        validate_recovery_buffer(&buffer)?;
+        if buffer.relative_path.is_none() {
+            if buffer.dirty {
+                documents.push(DocumentDto {
+                    project_id: project.project_id,
+                    document_id: None,
+                    relative_path: None,
+                    content: buffer.content.clone().unwrap_or_default(),
+                    write_revision: buffer.write_revision,
+                    baseline_hash: String::new(),
+                    conflict: None,
+                    recovery: Some(buffer),
+                });
+            }
+            continue;
+        }
+        let relative = validate_relative(buffer.relative_path.as_deref().expect("checked"), true)?;
+        let (disk, identity) = match read_file_at(&snapshot.root_fd, &relative) {
+            Ok(value) => value,
+            Err(_error) if buffer.dirty => (
+                String::new(),
+                FileIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+            ),
+            Err(error) => {
+                return Err(format!(
+                    "Could not restore clean recovery snapshot: {error}"
+                ));
+            }
+        };
+        let mut conflict = None;
+        let content = if buffer.dirty {
+            let content = buffer
+                .content
+                .clone()
+                .ok_or_else(|| "Dirty recovery snapshot is missing content".to_string())?;
+            let baseline_matches = valid_file_bound_baseline(&buffer)
+                && !disk.is_empty()
+                && hash_content(&disk) == buffer.baseline_hash.clone().unwrap_or_default();
+            let pending_reconciliation = pending_operations.iter().find(|operation| {
+                buffer.reconciliation_operation_key.as_deref()
+                    == Some(operation.operation_key.as_str())
+                    && buffer.reconciliation_client_edit_version
+                        == Some(operation.client_edit_version)
+                    && buffer.client_edit_version == operation.client_edit_version
+                    && buffer.relative_path.as_deref() == Some(operation.relative_path.as_str())
+                    && buffer
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| hash_content(content) == operation.content_blake3)
+                    && hash_content(&disk) == operation.content_blake3
+                    && file_identity_text(identity) == operation.file_identity
+            });
+            if let Some(operation) = pending_reconciliation {
+                // The saved disk bytes are authoritative proof that this is a
+                // post-commit recovery handoff, not an external edit. Keep the
+                // draft until the frontend calls reconciliation with the opaque
+                // key, but bind the fresh live document to the disk baseline.
+                buffer.baseline_hash = Some(operation.content_blake3.clone());
+                buffer.reconciliation_operation_key = Some(operation.operation_key.clone());
+                buffer.reconciliation_client_edit_version = Some(operation.client_edit_version);
+            } else if !baseline_matches {
+                conflict = Some(
+                    "CONFLICT: File changed while AMTE was closed; recovered draft is retained"
+                        .into(),
+                );
+            }
+            content
+        } else {
+            buffer.baseline_hash = Some(hash_content(&disk));
+            disk.clone()
+        };
+        let mut state = authority
+            .0
+            .lock()
+            .map_err(|_| "Project state is unavailable".to_string())?;
+        if state.project.as_ref().is_none_or(|active| {
+            active.identity != snapshot.project_id || active.session_token != snapshot.session_token
+        }) {
+            return Err("STALE_COMPLETION: project changed during recovery restore".into());
+        }
+        let id = activate_recovered_document(
+            &mut state,
+            relative,
+            identity,
+            &disk,
+            buffer.write_revision,
+            buffer
+                .document_id
+                .ok_or_else(|| "Recovery document identity is missing".to_string())?,
+        )?;
+        // The DTO (and its frontend cache) must carry only the freshly minted
+        // authority. The historical ID is retained solely in the retired DB
+        // binding once rebind commits below.
+        buffer.document_id = Some(id);
+        if conflict.is_some() {
+            state
+                .project
+                .as_mut()
+                .expect("project")
+                .documents
+                .get_mut(&id)
+                .expect("document")
+                .baseline_hash = buffer.baseline_hash.clone().unwrap_or_default();
+        }
+        let active = state.project.as_ref().expect("project");
+        let mut dto = document_dto(
+            active,
+            active.documents.get(&id).expect("document"),
+            content,
+        );
+        dto.conflict = conflict;
+        dto.recovery = Some(buffer);
+        documents.push(dto);
+    }
+    Ok(RestoreDto {
+        project,
+        documents,
+        active_relative_path: recovered.active_path,
+    })
+}
+
+/// Publish all freshly minted restored document authorities in one RecoveryDb
+/// transaction. Clean buffers then receive a normal clean checkpoint so their
+/// copied UI state follows the disk baseline read during restore; dirty buffers
+/// deliberately retain their draft/conflict snapshot.
+fn bind_restored_recovery_v2(db: &RecoveryDb, restored: &RestoreDto) -> Result<(), String> {
+    let bindings = restored
+        .documents
+        .iter()
+        .filter_map(|document| Some((document.relative_path.clone()?, document.document_id?)))
+        .collect::<Vec<_>>();
+    // Only descriptor-read bytes are eligible to accompany a journal into the
+    // fresh session. Failed reads and changed files are intentionally omitted:
+    // their old-token journal remains unusable and reconciliation fails closed.
+    let root = PathBuf::from(&restored.project.root);
+    let root_fd = open_directory_path(&root)?;
+    let operation_rebinds = db
+        .pending_save_operations(&restored.project.root)?
+        .into_iter()
+        .filter_map(|operation| {
+            let relative = validate_relative(&operation.relative_path, true).ok()?;
+            let (content, identity) = read_file_at(&root_fd, &relative).ok()?;
+            Some(recovery_db::SaveOperationRebind {
+                operation_key: operation.operation_key,
+                content_blake3: hash_content(&content),
+                file_identity: file_identity_text(identity),
+            })
+        })
+        .collect::<Vec<_>>();
+    db.rebind_session_bindings_and_activate_with_operations(
+        &restored.project.root,
+        &restored.project.session_token,
+        &bindings,
+        &operation_rebinds,
+    )?;
+    for document in &restored.documents {
+        let Some(recovery) = document.recovery.as_ref() else {
+            continue;
+        };
+        if recovery.dirty {
+            continue;
+        }
+        let (Some(relative_path), Some(document_id)) =
+            (document.relative_path.as_deref(), document.document_id)
+        else {
+            continue;
+        };
+        db.write_clean_checkpoint_for_session(
+            &restored.project.root,
+            relative_path,
+            document_id,
+            document.write_revision,
+            recovery.client_edit_version,
+            document.baseline_hash.clone(),
+            &restored.project.session_token,
+        )?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn restore_last_project(
     app: AppHandle,
     authority: State<'_, ProjectAuthority>,
     recovery: State<'_, RecoveryAuthority>,
+    activation: State<'_, ActivationAuthority>,
 ) -> Result<Option<RestoreDto>, String> {
+    // Restore also mints and publishes a project session, so it shares the
+    // activation gate with picker-driven project replacement.
+    let _activation = activation
+        .0
+        .lock()
+        .map_err(|_| "Project activation state is unavailable".to_string())?;
     let store = ProjectStore::for_app(&app)?;
     if let Some(stored) = store.read() {
         // Recovery is keyed by the canonical root recorded for the last active
         // project; a different project can never overwrite or be restored as it.
         if let Ok(root) = canonical_project_root(Path::new(&stored.root)) {
             let canonical = root.display().to_string();
+            let (recovered, pending_operations) = {
+                let _transaction = recovery
+                    .0
+                    .lock()
+                    .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+                // A V2 error is surfaced rather than silently falling back to a
+                // fresh database or legacy data. Existing V1 bytes stay untouched.
+                let db = recovery_db_for_app(&app)?;
+                let recovered = restore_v2_before_legacy(&db, &canonical, || {
+                    import_legacy_recovery_once(&app, &db, &canonical)
+                })?;
+                let pending = if recovered.is_some() {
+                    db.pending_save_operations(&canonical)?
+                } else {
+                    Vec::new()
+                };
+                (recovered, pending)
+            };
+            if let Some(recovered) = recovered {
+                let restored =
+                    restore_recovery_v2(&authority, &root, recovered, &pending_operations)?;
+                let _transaction = recovery
+                    .0
+                    .lock()
+                    .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
+                bind_restored_recovery_v2(&recovery_db_for_app(&app)?, &restored)?;
+                return Ok(Some(restored));
+            }
+        }
+        let restored = restore_from_state(&app, &authority, stored)?;
+        if let Some(restored) = restored.as_ref() {
+            let bindings = restored
+                .documents
+                .iter()
+                .filter_map(|document| {
+                    Some((document.relative_path.clone()?, document.document_id?))
+                })
+                .collect::<Vec<_>>();
             let _transaction = recovery
                 .0
                 .lock()
                 .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
-            let recovery_store = RecoveryStore::for_root(&app, &canonical)?;
-            if let Ok(Some(manifest)) = recovery_store.read_bound(&canonical) {
-                // Corrupt, stale, or misbound recovery never activates another root;
-                // disk-backed stored-project restore below is the safe fallback.
-                if let Ok(Some(restored)) =
-                    restore_recovery(&recovery_store, &authority, manifest, &root)
-                {
-                    return Ok(Some(restored));
-                }
-            }
+            recovery_db_for_app(&app)?.rebind_session_bindings_and_activate(
+                &restored.project.root,
+                &restored.project.session_token,
+                &bindings,
+            )?;
         }
-        let restored = restore_from_state(&app, &authority, stored)?;
         if restored.is_none() {
             store.clear_v1();
         }
@@ -2538,14 +4725,19 @@ fn discard_recovery_and_exit(
 ) -> Result<(), String> {
     // Project identity is read and released before taking the recovery lock;
     // no ProjectAuthority guard survives any filesystem operation.
-    let root = recovery_project_root(&authority, project_id)?;
+    let snapshot = capture_authorization_snapshot(&authority, project_id, None, None)?;
     let _transaction = recovery
         .0
         .lock()
         .map_err(|_| "Recovery transaction state is unavailable".to_string())?;
     terminal_discard(
         || {
-            RecoveryStore::for_root(&app, &root)?.clear()?;
+            // A discard fence makes every queued writer stale before rows are
+            // terminally discarded, in the same SQLite transaction.
+            recovery_db_for_app(&app)?.deactivate_and_discard_session(
+                &snapshot.root.display().to_string(),
+                &snapshot.session_token,
+            )?;
             let mut state = close
                 .0
                 .lock()
@@ -2574,6 +4766,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(ProjectAuthority::default())
         .manage(RecoveryAuthority::default())
+        .manage(ActivationAuthority::default())
         .manage(CloseAuthority::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -2625,6 +4818,7 @@ fn main() {
             save_document,
             save_document_as,
             autosave_document,
+            reconcile_save_operation,
             write_recovery_buffer,
             write_recovery_manifest,
             delete_recovery_project,
@@ -2643,11 +4837,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
     fn temp(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let path = PathBuf::from("/tmp/opencode").join(format!(
             "amte-{name}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2661,6 +4856,65 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         path
+    }
+    fn legacy_entry_fingerprint(store: &RecoveryStore) -> Vec<(String, String, Vec<u8>)> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut entries = fs::read_dir(&store.directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let kind = if metadata.file_type().is_symlink() {
+                    "symlink"
+                } else if metadata.is_file() {
+                    "file"
+                } else if metadata.is_dir() {
+                    "directory"
+                } else {
+                    "other"
+                };
+                let bytes = if metadata.file_type().is_symlink() {
+                    fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec()
+                } else if metadata.is_file() {
+                    fs::read(&path).unwrap()
+                } else {
+                    Vec::new()
+                };
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    kind.into(),
+                    bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+    fn assert_no_legacy_import(db: &RecoveryDb, root: &str) {
+        assert_eq!(
+            db.legacy_import_test_state(root).unwrap(),
+            (None, 0, 0, Vec::new()),
+            "a failed import must not create a marker, project buffers, or snapshots"
+        );
+    }
+    fn migration_fixture(name: &str) -> (PathBuf, PathBuf, String, RecoveryStore, RecoveryDb) {
+        let base = temp(name);
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let directory = base.join(RecoveryStore::project_key(&canonical));
+        let store = RecoveryStore {
+            base: base.clone(),
+            manifest: directory.join("manifest.json"),
+            directory,
+        };
+        let db = RecoveryDb::for_config(&base.join("xdg")).unwrap();
+        (base, root, canonical, store, db)
     }
     fn authority(root: &Path) -> ProjectAuthority {
         let authority = ProjectAuthority::default();
@@ -2711,7 +4965,8 @@ mod tests {
     #[test]
     fn descriptor_bound_io_rejects_symlink_and_stays_in_root() {
         let root = temp("io");
-        let outside = temp("outside").join("sentinel.md");
+        let outside_directory = temp("outside");
+        let outside = outside_directory.join("sentinel.md");
         fs::write(&outside, "safe").unwrap();
         fs::write(root.join("ok.md"), "old").unwrap();
         #[cfg(unix)]
@@ -2725,6 +4980,7 @@ mod tests {
         assert!(read_file_at(&fd, Path::new("escape-dir/sentinel.md")).is_err());
         assert_eq!(fs::read_to_string(outside).unwrap(), "safe");
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside_directory).unwrap();
     }
     #[test]
     fn hardlinked_outside_file_is_rejected_for_read_manual_save_and_autosave() {
@@ -3104,6 +5360,7 @@ mod tests {
             document_id: Some(document_id),
             write_revision: 4,
             sequence,
+            client_edit_version: sequence,
             dirty: content.is_some(),
             content: content.map(str::to_owned),
             payload: None,
@@ -3126,6 +5383,8 @@ mod tests {
                 added: 2,
                 deleted: 1,
             }),
+            reconciliation_operation_key: None,
+            reconciliation_client_edit_version: None,
         }
     }
 
@@ -3187,6 +5446,113 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn frontend_write_invoke_fixture_decodes_only_the_write_dto() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct InvokeFixture {
+            project_id: u64,
+            buffer: RecoveryWriteRequest,
+        }
+
+        // This fixture is the literal `{ projectId, buffer }` shape emitted by
+        // app.js, so serde checks the command boundary rather than a mock DTO.
+        let fixture: InvokeFixture =
+            serde_json::from_str(include_str!("../../src/recovery-write-invoke.fixture.json"))
+                .unwrap();
+        assert_eq!(fixture.project_id, 42);
+        let buffer = fixture.buffer.into_buffer();
+        assert_eq!(buffer.sequence, 0, "SQLite, never the webview, owns IDs");
+        assert_eq!(buffer.client_edit_version, 14);
+        assert_eq!(
+            buffer.content.as_deref(),
+            Some("Draft from the real frontend invoke shape")
+        );
+
+        let mut forged: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/recovery-write-invoke.fixture.json"))
+                .unwrap();
+        forged["buffer"]["recoverySequence"] = serde_json::json!(99);
+        assert!(serde_json::from_value::<InvokeFixture>(forged).is_err());
+    }
+
+    #[test]
+    fn frontend_cannot_forge_or_replay_a_clean_recovery_invoke() {
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/recovery-write-invoke.fixture.json"))
+                .unwrap();
+        fixture["buffer"]["dirty"] = serde_json::json!(false);
+        fixture["buffer"]["content"] = serde_json::Value::Null;
+        let request: RecoveryWriteRequest =
+            serde_json::from_value(fixture["buffer"].clone()).unwrap();
+        assert!(
+            into_dirty_recovery_request(request)
+                .unwrap_err()
+                .contains("dirty snapshots only")
+        );
+    }
+
+    #[test]
+    fn activation_faults_keep_old_authority_until_all_steps_succeed() {
+        fn project(root: &str, identity: u64) -> ActiveProject {
+            ActiveProject {
+                root: PathBuf::from(root),
+                root_fd: Arc::new(File::open("/dev/null").unwrap()),
+                identity,
+                session_token: ProjectAuthority::session_token(Path::new(root), identity),
+                documents: HashMap::new(),
+                paths: HashMap::new(),
+            }
+        }
+        for phase in ["persist", "discard"] {
+            let mut state = ProjectState {
+                project: Some(project("/old", 1)),
+                pending_project: Some((9, PathBuf::from("/new"))),
+                next_identity: 9,
+            };
+            let result = commit_project_activation(
+                &mut state,
+                9,
+                project("/new", 10),
+                || {
+                    if phase == "persist" {
+                        Err("persist fault".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    if phase == "discard" {
+                        Err("discard fault".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || Ok(()),
+            );
+            assert!(result.is_err(), "{phase}");
+            assert_eq!(state.project.as_ref().unwrap().identity, 1, "{phase}");
+            assert_eq!(state.pending_project.as_ref().unwrap().0, 9, "{phase}");
+        }
+        let mut state = ProjectState {
+            project: Some(project("/old", 1)),
+            pending_project: Some((9, PathBuf::from("/new"))),
+            next_identity: 9,
+        };
+        let committed = commit_project_activation(
+            &mut state,
+            9,
+            project("/new", 10),
+            || Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(committed.project_id, 10);
+        assert_eq!(state.project.as_ref().unwrap().identity, 10);
+        assert!(state.pending_project.is_none());
     }
 
     #[test]
@@ -3357,7 +5723,8 @@ mod tests {
             .unwrap();
         assert_eq!(clean.content, unicode_disk);
         assert!(clean.conflict.is_none());
-        assert_eq!(clean.document_id, Some(11));
+        assert_ne!(clean.document_id, Some(11));
+        assert_ne!(clean.document_id, Some(12));
         assert_eq!(clean.write_revision, 4);
         let current_baseline = hash_content(unicode_disk);
         assert_eq!(clean.baseline_hash, current_baseline);
@@ -3406,18 +5773,10 @@ mod tests {
         );
         next.write_revision = clean.write_revision;
         next.baseline_hash = Some(clean.baseline_hash.clone());
-        write_recovery_transaction(&store, &root_text, next).unwrap();
-        let updated = store.read_bound(&root_text).unwrap().unwrap();
-        let metadata = updated
-            .buffers
-            .iter()
-            .find(|entry| entry.relative_path.as_deref() == Some("a.md"))
-            .unwrap();
-        assert_eq!(metadata.sequence, 12);
-        assert_eq!(
-            metadata.baseline_hash.as_deref(),
-            Some(current_baseline.as_str())
-        );
+        // V1 manifests are read-only migration input. Their historical ID is
+        // intentionally not accepted for the fresh restored authority; V2
+        // creates the replacement binding before any future snapshot write.
+        assert!(write_recovery_transaction(&store, &root_text, next).is_err());
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(base).unwrap();
@@ -4190,6 +6549,2594 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.read().unwrap().unwrap().buffers.len(), 1);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_v1_import_is_atomic_idempotent_and_preserves_every_legacy_byte() {
+        // This test deliberately uses only an approved synthetic root.
+        let base = PathBuf::from("/tmp/opencode").join(format!(
+            "amte-legacy-import-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("clean.md"), "disk current").unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let directory = base.join(RecoveryStore::project_key(&canonical));
+        let store = RecoveryStore {
+            base: base.clone(),
+            manifest: directory.join("manifest.json"),
+            directory,
+        };
+        let mut dirty = recovery_buffer("dirty.md", 7, 8, Some("draft bytes"));
+        dirty.client_edit_version = 0;
+        let mut clean = recovery_buffer("clean.md", 8, 9, None);
+        clean.client_edit_version = 0;
+        write_recovery_transaction(&store, &canonical, dirty.clone()).unwrap();
+        write_recovery_transaction(&store, &canonical, clean.clone()).unwrap();
+        let before = fs::read_dir(&store.directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let db = RecoveryDb::for_config(&base.join("xdg")).unwrap();
+        import_legacy_recovery_store_once(&store, &db, &canonical).unwrap();
+        assert_eq!(
+            db.legacy_import_test_state(&canonical).unwrap(),
+            (Some("imported-v1".into()), 2, 2, vec![1, 1])
+        );
+        let restored = db.latest(&canonical).unwrap().unwrap();
+        assert_eq!(restored.buffers.len(), 2);
+        assert_eq!(
+            restored
+                .buffers
+                .iter()
+                .find(|buffer| buffer.relative_path.as_deref() == Some("dirty.md"))
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("draft bytes")
+        );
+        assert!(
+            restored
+                .buffers
+                .iter()
+                .find(|buffer| buffer.relative_path.as_deref() == Some("clean.md"))
+                .unwrap()
+                .content
+                .is_none()
+        );
+        assert_eq!(
+            before,
+            fs::read_dir(&store.directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<Vec<_>>()
+        );
+        // Repeated import observes the terminal marker and cannot duplicate rows.
+        import_legacy_recovery_store_once(&store, &db, &canonical).unwrap();
+        assert_eq!(
+            db.legacy_import_test_state(&canonical).unwrap(),
+            (Some("imported-v1".into()), 2, 2, vec![1, 1])
+        );
+        let mut next = dirty.clone();
+        next.client_edit_version = 10;
+        next.content = Some("newer".into());
+        assert_eq!(
+            db.write_snapshot(&canonical, None, &next)
+                .unwrap()
+                .recovery_sequence,
+            2
+        );
+        // The immutable import event may point at the first snapshot, but its
+        // audit record must survive pruning more than the per-buffer window.
+        for version in 11..=31 {
+            let mut revision = dirty.clone();
+            revision.write_revision = version;
+            revision.client_edit_version = version;
+            revision.content = Some(format!("post-import-{version}"));
+            db.write_snapshot(&canonical, None, &revision).unwrap();
+        }
+        let restored_after_retention = db.latest(&canonical).unwrap().unwrap();
+        assert_eq!(
+            restored_after_retention
+                .buffers
+                .iter()
+                .find(|buffer| buffer.relative_path.as_deref() == Some("dirty.md"))
+                .and_then(|buffer| buffer.content.as_deref()),
+            Some("post-import-31")
+        );
+        let connection = rusqlite::Connection::open(db.test_path()).unwrap();
+        let project_key = blake3::hash(canonical.as_bytes()).to_hex().to_string();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT outcome FROM legacy_imports WHERE project_key=?1",
+                    [&project_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "imported-v1"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM snapshots s JOIN buffers b ON b.id=s.buffer_id WHERE b.project_key=?1 AND b.relative_path='dirty.md'",
+                    [&project_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            20
+        );
+        assert_eq!(
+            before,
+            fs::read_dir(&store.directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn corrupt_legacy_import_is_retryable_and_existing_v2_wins() {
+        let base = PathBuf::from("/tmp/opencode").join(format!(
+            "amte-legacy-reject-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let directory = base.join(RecoveryStore::project_key(&canonical));
+        let store = RecoveryStore {
+            base: base.clone(),
+            manifest: directory.join("manifest.json"),
+            directory,
+        };
+        let mut legacy = recovery_buffer("a.md", 1, 1, Some("legacy"));
+        legacy.client_edit_version = 0;
+        write_recovery_transaction(&store, &canonical, legacy.clone()).unwrap();
+        let manifest = store.read_bound(&canonical).unwrap().unwrap();
+        let payload = store
+            .directory
+            .join(manifest.buffers[0].payload.as_ref().unwrap());
+        let original = fs::read(&payload).unwrap();
+        fs::write(&payload, b"corrupt").unwrap();
+        let db = RecoveryDb::for_config(&base.join("xdg")).unwrap();
+        assert!(import_legacy_recovery_store_once(&store, &db, &canonical).is_err());
+        assert_no_legacy_import(&db, &canonical);
+        fs::write(&payload, &original).unwrap();
+        import_legacy_recovery_store_once(&store, &db, &canonical).unwrap();
+        assert_eq!(
+            db.legacy_import_test_state(&canonical).unwrap(),
+            (Some("imported-v1".into()), 1, 1, vec![1])
+        );
+        let mut v2 = legacy.clone();
+        v2.client_edit_version = 2;
+        v2.content = Some("v2".into());
+        db.write_snapshot(&canonical, None, &v2).unwrap();
+        assert!(import_legacy_recovery_store_once(&store, &db, &canonical).is_ok());
+        assert_eq!(
+            db.legacy_import_test_state(&canonical).unwrap(),
+            (Some("imported-v1".into()), 1, 2, vec![1, 2])
+        );
+        assert!(import_legacy_recovery_store_once(&store, &db, "/wrong/root").is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn committed_v2_marker_restores_before_corrupt_legacy_is_even_parsed() {
+        let base = temp("v2-before-legacy");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let directory = base.join(RecoveryStore::project_key(&canonical));
+        let store = RecoveryStore {
+            base: base.clone(),
+            manifest: directory.join("manifest.json"),
+            directory,
+        };
+        let mut legacy = recovery_buffer("chapter.md", 1, 1, Some("legacy draft"));
+        legacy.client_edit_version = 0;
+        write_recovery_transaction(&store, &canonical, legacy).unwrap();
+        let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+        import_legacy_recovery_store_once(&store, &db, &canonical).unwrap();
+
+        // Make the V1 payload hostile after the committed V2 import. Calling
+        // its parser would now fail; the startup ordering must not call it.
+        let manifest = store.read_bound(&canonical).unwrap().unwrap();
+        fs::write(
+            store
+                .directory
+                .join(manifest.buffers[0].payload.as_ref().unwrap()),
+            b"corrupt legacy",
+        )
+        .unwrap();
+        let called = std::cell::Cell::new(false);
+        let restored = restore_v2_before_legacy(&db, &canonical, || {
+            called.set(true);
+            import_legacy_recovery_store_once(&store, &db, &canonical)
+        })
+        .unwrap()
+        .unwrap();
+        assert!(
+            !called.get(),
+            "a valid V2 row/marker must short-circuit V1 parsing"
+        );
+        assert_eq!(restored.buffers[0].content.as_deref(), Some("legacy draft"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_imported_dirty_disk_divergence_restores_a_conflict_and_blocks_both_save_paths() {
+        let (base, root, canonical, store, db) = migration_fixture("legacy-conflict");
+        let document = root.join("chapter.md");
+        fs::write(&document, "disk baseline").unwrap();
+        let mut dirty = recovery_buffer("chapter.md", 7, 8, Some("recovered draft"));
+        dirty.client_edit_version = 0;
+        dirty.baseline_hash = Some(hash_content("disk baseline"));
+        write_recovery_transaction(&store, &canonical, dirty).unwrap();
+        let legacy_before = legacy_entry_fingerprint(&store);
+        fs::write(&document, "disk changed while closed").unwrap();
+
+        import_legacy_recovery_store_once(&store, &db, &canonical).unwrap();
+        assert_eq!(legacy_entry_fingerprint(&store), legacy_before);
+        assert_eq!(
+            db.legacy_import_test_state(&canonical).unwrap(),
+            (Some("imported-v1".into()), 1, 1, vec![1])
+        );
+        let authority = ProjectAuthority::default();
+        let restored = restore_recovery_v2(
+            &authority,
+            &root,
+            db.latest(&canonical).unwrap().unwrap(),
+            &[],
+        )
+        .unwrap();
+        let recovered = &restored.documents[0];
+        assert_eq!(recovered.content, "recovered draft");
+        assert!(
+            recovered
+                .conflict
+                .as_deref()
+                .is_some_and(|message| message.starts_with("CONFLICT:"))
+        );
+        let document_id = recovered.document_id.unwrap();
+        let disk_before_save_attempts = fs::read_to_string(&document).unwrap();
+        let mut state = authority.0.lock().unwrap();
+        let project = state.project.as_mut().unwrap();
+        let manual = write_document_revision(project, document_id, 9, "manual save must not win")
+            .unwrap_err();
+        let autosave =
+            write_document_revision(project, document_id, 10, "autosave must not win").unwrap_err();
+        assert!(manual.starts_with("CONFLICT:"));
+        assert!(autosave.starts_with("CONFLICT:"));
+        drop(state);
+        assert_eq!(
+            fs::read_to_string(&document).unwrap(),
+            disk_before_save_attempts
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_import_missing_dirty_payload_is_retryable_and_never_marks_or_mutates_v1() {
+        let (base, _root, canonical, store, db) = migration_fixture("legacy-missing-payload");
+        let mut dirty = recovery_buffer("missing.md", 1, 1, Some("recover me"));
+        dirty.client_edit_version = 0;
+        write_recovery_transaction(&store, &canonical, dirty).unwrap();
+        let manifest = store.read_bound(&canonical).unwrap().unwrap();
+        let payload = store
+            .directory
+            .join(manifest.buffers[0].payload.as_ref().unwrap());
+        let payload_bytes = fs::read(&payload).unwrap();
+        fs::remove_file(&payload).unwrap();
+        let legacy_before = legacy_entry_fingerprint(&store);
+
+        assert!(import_legacy_recovery_store_once(&store, &db, &canonical).is_err());
+        assert_no_legacy_import(&db, &canonical);
+        assert_eq!(legacy_entry_fingerprint(&store), legacy_before);
+
+        fs::write(&payload, payload_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&payload, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        import_legacy_recovery_store_once(&store, &db, &canonical).unwrap();
+        assert_eq!(
+            db.legacy_import_test_state(&canonical).unwrap(),
+            (Some("imported-v1".into()), 1, 1, vec![1])
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_import_enforces_all_v1_bounds_before_v2_commit() {
+        // Oversized manifest: read() rejects based on metadata before creating
+        // its input Vec or opening a SQLite import transaction.
+        let (base, _root, canonical, store, db) = migration_fixture("legacy-bound-manifest");
+        fs::create_dir_all(&store.directory).unwrap();
+        fs::write(&store.manifest, vec![b'x'; RECOVERY_MAX_MANIFEST_BYTES + 1]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&store.manifest, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let legacy_before = legacy_entry_fingerprint(&store);
+        assert!(import_legacy_recovery_store_once(&store, &db, &canonical).is_err());
+        assert_no_legacy_import(&db, &canonical);
+        assert_eq!(legacy_entry_fingerprint(&store), legacy_before);
+        fs::remove_dir_all(base).unwrap();
+
+        // Oversized payload metadata is rejected before read_payload can reserve
+        // or read the oversized legacy file.
+        let (base, _root, canonical, store, db) = migration_fixture("legacy-bound-payload");
+        let mut buffer = recovery_buffer("large.md", 1, 1, Some("small metadata payload"));
+        buffer.client_edit_version = 0;
+        write_recovery_transaction(&store, &canonical, buffer).unwrap();
+        let mut manifest = store.read_bound(&canonical).unwrap().unwrap();
+        let payload = store
+            .directory
+            .join(manifest.buffers[0].payload.as_ref().unwrap());
+        fs::write(&payload, vec![b'p'; RECOVERY_MAX_PAYLOAD_BYTES + 1]).unwrap();
+        manifest.buffers[0].payload_bytes = Some(RECOVERY_MAX_PAYLOAD_BYTES + 1);
+        fs::write(&store.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let legacy_before = legacy_entry_fingerprint(&store);
+        assert!(import_legacy_recovery_store_once(&store, &db, &canonical).is_err());
+        assert_no_legacy_import(&db, &canonical);
+        assert_eq!(legacy_entry_fingerprint(&store), legacy_before);
+        fs::remove_dir_all(base).unwrap();
+
+        // An over-count manifest is rejected before payload reads or V2 rows.
+        let (base, _root, canonical, store, db) = migration_fixture("legacy-bound-count");
+        let mut buffer = recovery_buffer("one.md", 1, 1, Some("one"));
+        buffer.client_edit_version = 0;
+        write_recovery_transaction(&store, &canonical, buffer).unwrap();
+        let mut manifest = store.read_bound(&canonical).unwrap().unwrap();
+        manifest.buffers = vec![manifest.buffers[0].clone(); RECOVERY_MAX_BUFFERS + 1];
+        fs::write(&store.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let legacy_before = legacy_entry_fingerprint(&store);
+        assert!(import_legacy_recovery_store_once(&store, &db, &canonical).is_err());
+        assert_no_legacy_import(&db, &canonical);
+        assert_eq!(legacy_entry_fingerprint(&store), legacy_before);
+        fs::remove_dir_all(base).unwrap();
+
+        // Aggregate declared bytes are bounded while parsing the manifest, so no
+        // individual payload is opened when the total is too large.
+        let (base, _root, canonical, store, db) = migration_fixture("legacy-bound-total");
+        let mut initial = recovery_buffer("seed.md", 1, 1, Some("seed"));
+        initial.client_edit_version = 0;
+        write_recovery_transaction(&store, &canonical, initial).unwrap();
+        let mut manifest = store.read_bound(&canonical).unwrap().unwrap();
+        manifest.buffers = (0..5)
+            .map(|index| {
+                let buffer = recovery_buffer(
+                    &format!("buffer-{index}.md"),
+                    index + 1,
+                    index + 1,
+                    Some("declared but never opened"),
+                );
+                let (mut metadata, _) = payload_metadata(&buffer);
+                metadata.payload_bytes = Some(RECOVERY_MAX_PAYLOAD_BYTES);
+                metadata
+            })
+            .collect();
+        fs::write(&store.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let legacy_before = legacy_entry_fingerprint(&store);
+        assert!(import_legacy_recovery_store_once(&store, &db, &canonical).is_err());
+        assert_no_legacy_import(&db, &canonical);
+        assert_eq!(legacy_entry_fingerprint(&store), legacy_before);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_import_fails_closed_on_hostile_storage_without_touching_v1_or_outside() {
+        for attack in [
+            "manifest-symlink",
+            "payload-symlink",
+            "payload-hardlink",
+            "insecure-file",
+            "insecure-directory",
+            "nonregular-payload",
+        ] {
+            let (base, _root, canonical, store, db) =
+                migration_fixture(&format!("legacy-hostile-{attack}"));
+            let mut buffer = recovery_buffer("attack.md", 1, 1, Some("legacy draft"));
+            buffer.client_edit_version = 0;
+            write_recovery_transaction(&store, &canonical, buffer).unwrap();
+            let manifest = store.read_bound(&canonical).unwrap().unwrap();
+            let payload = store
+                .directory
+                .join(manifest.buffers[0].payload.as_ref().unwrap());
+            let outside = base.join("outside-target");
+            fs::write(&outside, "outside bytes must remain exact").unwrap();
+            match attack {
+                "manifest-symlink" => {
+                    fs::remove_file(&store.manifest).unwrap();
+                    std::os::unix::fs::symlink(&outside, &store.manifest).unwrap();
+                }
+                "payload-symlink" => {
+                    fs::remove_file(&payload).unwrap();
+                    std::os::unix::fs::symlink(&outside, &payload).unwrap();
+                }
+                "payload-hardlink" => {
+                    fs::remove_file(&payload).unwrap();
+                    fs::hard_link(&outside, &payload).unwrap();
+                }
+                "insecure-file" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&payload, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                "insecure-directory" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&store.directory, fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                "nonregular-payload" => {
+                    fs::remove_file(&payload).unwrap();
+                    fs::create_dir(&payload).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let legacy_before = legacy_entry_fingerprint(&store);
+            assert!(
+                import_legacy_recovery_store_once(&store, &db, &canonical).is_err(),
+                "{attack} must fail closed"
+            );
+            assert_no_legacy_import(&db, &canonical);
+            assert_eq!(legacy_entry_fingerprint(&store), legacy_before, "{attack}");
+            assert_eq!(
+                fs::read_to_string(&outside).unwrap(),
+                "outside bytes must remain exact",
+                "{attack} must not follow or alter outside targets"
+            );
+            if attack == "payload-hardlink" {
+                assert_eq!(
+                    fs::read_to_string(&payload).unwrap(),
+                    "outside bytes must remain exact"
+                );
+            }
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_import_fault_boundaries_roll_back_or_commit_once_and_retry_idempotently() {
+        for (fault, expected_after_error) in [
+            (
+                recovery_db::LegacyImportFault::BeforeCommit,
+                (None, 0, 0, vec![]),
+            ),
+            (
+                recovery_db::LegacyImportFault::AfterCommit,
+                (Some("imported-v1".into()), 1, 1, vec![1]),
+            ),
+        ] {
+            let (base, _root, canonical, store, db) = migration_fixture("legacy-import-fault");
+            let mut buffer = recovery_buffer("fault.md", 1, 1, Some("fault draft"));
+            buffer.client_edit_version = 0;
+            write_recovery_transaction(&store, &canonical, buffer).unwrap();
+            let legacy_before = legacy_entry_fingerprint(&store);
+
+            recovery_db::set_legacy_import_fault(Some(fault));
+            assert!(import_legacy_recovery_store_once(&store, &db, &canonical).is_err());
+            assert_eq!(
+                db.legacy_import_test_state(&canonical).unwrap(),
+                expected_after_error,
+                "{fault:?} database state"
+            );
+            assert_eq!(legacy_entry_fingerprint(&store), legacy_before);
+
+            import_legacy_recovery_store_once(&store, &db, &canonical).unwrap();
+            assert_eq!(
+                db.legacy_import_test_state(&canonical).unwrap(),
+                (Some("imported-v1".into()), 1, 1, vec![1]),
+                "retry after {fault:?} must have one terminal imported set"
+            );
+            assert_eq!(legacy_entry_fingerprint(&store), legacy_before);
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    fn reliability_root(name: &str) -> PathBuf {
+        let root = temp(&format!("reliability-v2-{name}"));
+        assert!(root.starts_with("/tmp/opencode"));
+        root
+    }
+
+    /// Reliability fixtures must disappear even when an assertion deliberately
+    /// fails while developing the destructive campaign.
+    struct ReliabilityCleanup(PathBuf);
+    impl Drop for ReliabilityCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn recovery_text(seed: u64, index: usize, large: bool) -> String {
+        if !large {
+            return format!("# buffer {index}\nseed={seed}\n😀 café\n");
+        }
+        let mut text = format!("# large buffer {index}\nseed={seed}\n😀 café — 日本語\n");
+        while text.len() < 400 * 1024 {
+            text.push_str("line with Unicode 😀 café — 日本語 and Markdown **bold**\n");
+        }
+        text
+    }
+
+    fn lcg(next: &mut u64) -> u64 {
+        *next = next
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *next
+    }
+
+    #[test]
+    fn recovery_v2_randomized_model_restart_campaign() {
+        let configured =
+            env::var("AMTE_RELIABILITY_SEEDS").unwrap_or_else(|_| "11,29,73,101".into());
+        let seeds = configured
+            .split(',')
+            .map(|seed| seed.parse::<u64>().expect("numeric reliability seed"))
+            .collect::<Vec<_>>();
+        assert!(
+            seeds.len() >= 4,
+            "three fixed seeds plus one logged random seed are required"
+        );
+
+        for seed in seeds {
+            let base = reliability_root(&format!("model-{seed}"));
+            let _cleanup = ReliabilityCleanup(base.clone());
+            let project = base.join("project");
+            fs::create_dir(&project).unwrap();
+            let root = project.canonicalize().unwrap().display().to_string();
+            let config = base.join("config");
+            let db = RecoveryDb::for_config(&config).unwrap();
+            let mut live = (0..20)
+                .map(|index| recovery_text(seed, index, index < 6))
+                .collect::<Vec<_>>();
+            let mut durable = live.clone();
+            let mut versions = [1u64; 20];
+            let mut histories = live
+                .iter()
+                .cloned()
+                .map(|text| vec![text])
+                .collect::<Vec<_>>();
+            let mut sequences = [0i64; 20];
+
+            for index in 0..20 {
+                let buffer = recovery_buffer(
+                    &format!("buffer-{index}.md"),
+                    index as u64 + 1,
+                    1,
+                    Some(&live[index]),
+                );
+                let ack = db
+                    .write_snapshot(&root, Some("buffer-0.md"), &buffer)
+                    .unwrap();
+                assert!(ack.durable && ack.recovery_sequence > sequences[index]);
+                sequences[index] = ack.recovery_sequence;
+            }
+
+            let mut random = seed;
+            // 1,000 operations for each of four seeds: 4,000 deterministic
+            // randomized edit/replace/delete/undo/switch/snapshot operations.
+            for operation in 0..1_000usize {
+                let index = (lcg(&mut random) as usize) % live.len();
+                match lcg(&mut random) % 6 {
+                    0 => live[index].push_str(&format!("edit-{seed}-{operation}-😀\n")),
+                    1 => {
+                        if live[index].len() > 64 && index >= 6 {
+                            let mut chars = live[index].chars().collect::<Vec<_>>();
+                            chars.truncate(chars.len().saturating_sub(3));
+                            live[index] = chars.into_iter().collect();
+                        }
+                    }
+                    2 => {
+                        if index >= 6 {
+                            live[index] = format!(
+                                "# replacement {operation}\n{}",
+                                live[index].chars().take(96).collect::<String>()
+                            );
+                        }
+                    }
+                    3 => {
+                        if histories[index].len() > 1 {
+                            let previous =
+                                (lcg(&mut random) as usize) % (histories[index].len() - 1);
+                            live[index] = histories[index][previous].clone();
+                        }
+                    }
+                    4 => { /* buffer switch: reference state must stay untouched */ }
+                    _ => { /* explicit snapshot below */ }
+                }
+                if index >= 6 {
+                    histories[index].push(live[index].clone());
+                    if histories[index].len() > 24 {
+                        histories[index].remove(0);
+                    }
+                }
+                if operation % 100 == 99 {
+                    // A checkpoint persists every changed small buffer. Large
+                    // Unicode buffers remain byte-identical to their initial
+                    // checkpoint, exercising large restore without exceeding
+                    // the bounded aggregate history budget.
+                    for index in 6..20 {
+                        if durable[index] != live[index] {
+                            versions[index] += 1;
+                            let mut buffer = recovery_buffer(
+                                &format!("buffer-{index}.md"),
+                                index as u64 + 1,
+                                versions[index],
+                                Some(&live[index]),
+                            );
+                            buffer.client_edit_version = versions[index];
+                            let ack = db
+                                .write_snapshot(&root, Some("buffer-0.md"), &buffer)
+                                .unwrap();
+                            assert!(ack.recovery_sequence > sequences[index]);
+                            sequences[index] = ack.recovery_sequence;
+                            durable[index] = live[index].clone();
+                        }
+                    }
+                    db.integrity_check().unwrap();
+                    let restarted = RecoveryDb::for_config(&config).unwrap();
+                    let restored = restarted.latest(&root).unwrap().unwrap();
+                    assert_eq!(restored.active_path.as_deref(), Some("buffer-0.md"));
+                    assert_eq!(restored.buffers.len(), 20);
+                    for buffer in restored.buffers {
+                        let index = buffer
+                            .relative_path
+                            .unwrap()
+                            .trim_start_matches("buffer-")
+                            .trim_end_matches(".md")
+                            .parse::<usize>()
+                            .unwrap();
+                        assert_eq!(
+                            buffer.content.as_deref(),
+                            Some(durable[index].as_str()),
+                            "seed={seed} checkpoint={operation} buffer={index}"
+                        );
+                    }
+                }
+            }
+
+            let mut stale = recovery_buffer("buffer-0.md", 1, 1, Some(&durable[0]));
+            stale.client_edit_version = 0;
+            assert!(
+                db.write_snapshot(&root, None, &stale)
+                    .unwrap_err()
+                    .contains("version")
+            );
+            // A corrupt newest dirty snapshot must never silently downgrade the
+            // user to an older clean state.
+            let path = db.test_path();
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute("UPDATE snapshots SET content='forged' WHERE id=(SELECT MAX(id) FROM snapshots)", []).unwrap();
+            assert!(
+                db.latest(&root)
+                    .unwrap_err()
+                    .contains("RECOVERY CORRUPTION")
+            );
+            db.integrity_check().unwrap();
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_v2_isolated_storage_and_latency_measurement() {
+        fn percentile(samples: &mut [f64], percentile: f64) -> f64 {
+            samples.sort_by(|left, right| left.total_cmp(right));
+            samples[((samples.len() as f64 * percentile).ceil() as usize).saturating_sub(1)]
+        }
+        fn file_size(path: &Path) -> u64 {
+            fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        }
+
+        let base = reliability_root("measurement");
+        let _cleanup = ReliabilityCleanup(base.clone());
+        let project = base.join("project");
+        fs::create_dir(&project).unwrap();
+        let root = project.canonicalize().unwrap().display().to_string();
+        let config = base.join("xdg-config");
+        let db = RecoveryDb::for_config(&config).unwrap();
+        let mut unicode_markdown = "# AMTE V2 performance fixture\n\n".to_owned();
+        const TARGET_BYTES: usize = 400 * 1024;
+        const LINE: &str = "Unicode 😀 café — 日本語 with **Markdown**\n";
+        while unicode_markdown.len() + LINE.len() <= TARGET_BYTES {
+            unicode_markdown.push_str(LINE);
+        }
+        assert!(unicode_markdown.len() <= TARGET_BYTES);
+
+        let mut snapshot_ms = Vec::new();
+        for index in 0..10u64 {
+            let buffer = recovery_buffer(
+                &format!("benchmark-{index}.md"),
+                index + 1,
+                1,
+                Some(&unicode_markdown),
+            );
+            let started = Instant::now();
+            let acknowledgement = db
+                .write_snapshot(&root, Some("benchmark-0.md"), &buffer)
+                .unwrap();
+            snapshot_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert!(acknowledgement.durable);
+            assert_eq!(acknowledgement.recovery_sequence, 1);
+        }
+        db.integrity_check().unwrap();
+        let database = db.test_path();
+        let wal = PathBuf::from(format!("{}-wal", database.display()));
+        let shm = PathBuf::from(format!("{}-shm", database.display()));
+        let db_bytes = file_size(&database);
+        let wal_bytes = file_size(&wal);
+        let shm_bytes = file_size(&shm);
+
+        let mut restore_ms = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let recovered = RecoveryDb::for_config(&config)
+                .unwrap()
+                .latest(&root)
+                .unwrap()
+                .unwrap();
+            restore_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(recovered.active_path.as_deref(), Some("benchmark-0.md"));
+            assert_eq!(recovered.buffers.len(), 10);
+            for (index, buffer) in recovered.buffers.iter().enumerate() {
+                assert_eq!(
+                    buffer.relative_path.as_deref(),
+                    Some(format!("benchmark-{index}.md").as_str())
+                );
+                assert_eq!(buffer.content.as_deref(), Some(unicode_markdown.as_str()));
+                assert_eq!(
+                    buffer
+                        .selection
+                        .as_ref()
+                        .map(|selection| (selection.anchor, selection.head)),
+                    Some((1, 2))
+                );
+            }
+        }
+
+        let retention_root = base.join("retention-project");
+        fs::create_dir(&retention_root).unwrap();
+        let retention_canonical = retention_root.canonicalize().unwrap().display().to_string();
+        let retention = RecoveryDb::for_config(&base.join("retention-config")).unwrap();
+        for version in 1..=25u64 {
+            retention
+                .write_snapshot(
+                    &retention_canonical,
+                    None,
+                    &recovery_buffer(
+                        "retained.md",
+                        1,
+                        version,
+                        Some(&format!("revision-{version}")),
+                    ),
+                )
+                .unwrap();
+        }
+        let (retained_rows, latest_sequence, retained_content_bytes) =
+            retention.test_snapshot_stats(&retention_canonical).unwrap();
+        assert_eq!(retained_rows, 20);
+        assert_eq!(latest_sequence, 25);
+        assert!(retained_content_bytes > 0);
+
+        let snapshot_p50 = percentile(&mut snapshot_ms, 0.50);
+        let snapshot_p95 = percentile(&mut snapshot_ms, 0.95);
+        let restore_p50 = percentile(&mut restore_ms, 0.50);
+        let restore_p95 = percentile(&mut restore_ms, 0.95);
+        // The frontend's trailing debounce coalesces 100 edits into this one
+        // committed backend transaction; BufferSession unit coverage asserts
+        // that no intermediate content version is persisted.
+        eprintln!(
+            "AMTE_RELIABILITY_METRICS {{\"payloadBytes\":{},\"buffers\":10,\"snapshotP50Ms\":{snapshot_p50:.3},\"snapshotP95Ms\":{snapshot_p95:.3},\"restoreP50Ms\":{restore_p50:.3},\"restoreP95Ms\":{restore_p95:.3},\"dbBytes\":{db_bytes},\"walBytes\":{wal_bytes},\"shmBytes\":{shm_bytes},\"retainedRows\":{retained_rows},\"retainedLatestSequence\":{latest_sequence},\"recoveryWrites\":1,\"keystrokes\":100}}",
+            unicode_markdown.len(),
+        );
+    }
+
+    #[test]
+    fn recovery_child_crash_phase() {
+        let Ok(root) = env::var("AMTE_RECOVERY_CHILD_ROOT") else {
+            return;
+        };
+        let phase = env::var("AMTE_RECOVERY_CHILD_PHASE").unwrap();
+        let db = RecoveryDb::for_config(&PathBuf::from(&root).join("config")).unwrap();
+        let phase = match phase.as_str() {
+            "before-transaction" => recovery_db::SnapshotCrashPhase::BeforeTransaction,
+            "after-payload" => recovery_db::SnapshotCrashPhase::AfterPayloadBeforeCommit,
+            "retention" => recovery_db::SnapshotCrashPhase::DuringRetention,
+            "after-commit" => recovery_db::SnapshotCrashPhase::AfterCommitAckLoss,
+            _ => panic!("unknown child crash phase"),
+        };
+        recovery_db::set_snapshot_crash_phase(Some(phase));
+        let mut next = recovery_buffer("crash.md", 1, 2, Some("new committed bytes 😀"));
+        next.client_edit_version = 2;
+        let _ = db.write_snapshot(&format!("{root}/project"), None, &next);
+        panic!("crash hook did not terminate its child");
+    }
+
+    #[test]
+    fn save_outcome_child_crash_phase() {
+        let Ok(base) = env::var("AMTE_SAVE_OUTCOME_CHILD_ROOT") else {
+            return;
+        };
+        let phase = match env::var("AMTE_SAVE_OUTCOME_CHILD_PHASE").as_deref() {
+            Ok("after-journal") => recovery_db::SaveOperationCrashPhase::AfterJournal,
+            Ok("after-checkpoint") => recovery_db::SaveOperationCrashPhase::AfterCheckpoint,
+            Ok("after-selector") => recovery_db::SaveOperationCrashPhase::AfterSelector,
+            _ => panic!("unknown SaveOutcome child crash phase"),
+        };
+        let token = "c".repeat(64);
+        let key = "d".repeat(64);
+        let content = "new exact bytes 😀";
+        let hash = hash_content(content);
+        let root = PathBuf::from(&base).join("project").display().to_string();
+        let db = RecoveryDb::for_config(&PathBuf::from(&base).join("config")).unwrap();
+        let root_fd = open_directory_path(Path::new(&root)).unwrap();
+        let (_, disk_identity) = read_file_at(&root_fd, Path::new("chapter.md")).unwrap();
+        recovery_db::set_save_operation_crash_phase(Some(phase));
+        db.record_file_commit(
+            &root,
+            &token,
+            &key,
+            "chapter.md",
+            "chapter.md",
+            7,
+            1,
+            1,
+            &hash,
+            &file_identity_text(disk_identity),
+        )
+        .unwrap();
+        db.mark_save_operation_pending_metadata(&root, &token, &key)
+            .unwrap();
+        db.reconcile_save_checkpoint(&root, &token, &key, "chapter.md", 7, 1, 1, hash)
+            .unwrap();
+        db.mark_save_selector_durable(&root, &token, &key).unwrap();
+        panic!("SaveOutcome crash hook did not terminate its child");
+    }
+
+    #[test]
+    fn save_outcome_post_commit_crash_restart_matrix_keeps_pending_operations_discoverable() {
+        let exe = env::current_exe().unwrap();
+        for (phase, checkpoint, selector) in [
+            ("after-journal", false, false),
+            ("after-checkpoint", true, false),
+            ("after-selector", true, true),
+        ] {
+            let base = reliability_root(&format!("save-outcome-crash-{phase}"));
+            let _cleanup = ReliabilityCleanup(base.clone());
+            let project = base.join("project");
+            fs::create_dir(&project).unwrap();
+            fs::write(project.join("chapter.md"), "new exact bytes 😀").unwrap();
+            let root = project.display().to_string();
+            let token = "c".repeat(64);
+            let fresh_token = "e".repeat(64);
+            let key = "d".repeat(64);
+            let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+            let mut dirty = recovery_buffer("chapter.md", 7, 1, Some("new exact bytes 😀"));
+            dirty.client_edit_version = 1;
+            dirty.baseline_hash = Some(hash_content("old exact bytes"));
+            db.write_snapshot(&root, None, &dirty).unwrap();
+            db.rebind_session_bindings_and_activate(
+                &root,
+                &token,
+                &[("chapter.md".to_string(), 7)],
+            )
+            .unwrap();
+            db.write_snapshot_for_session(&root, None, &token, &dirty)
+                .unwrap();
+
+            let status = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "tests::save_outcome_child_crash_phase",
+                    "--nocapture",
+                ])
+                .env("AMTE_SAVE_OUTCOME_CHILD_ROOT", &base)
+                .env("AMTE_SAVE_OUTCOME_CHILD_PHASE", phase)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "child must abort at {phase}");
+
+            let restarted = RecoveryDb::for_config(&base.join("config")).unwrap();
+            restarted.integrity_check().unwrap();
+            assert_eq!(
+                fs::read_to_string(project.join("chapter.md")).unwrap(),
+                "new exact bytes 😀"
+            );
+            // A real restart mints a fresh token and document identity. The
+            // opaque journal key must be handed to that fresh authority only
+            // after the restore-time disk and snapshot checks succeed.
+            restarted
+                .rebind_session_bindings_and_activate_with_operations(
+                    &root,
+                    &fresh_token,
+                    &[("chapter.md".into(), 8)],
+                    &[recovery_db::SaveOperationRebind {
+                        operation_key: key.clone(),
+                        content_blake3: hash_content("new exact bytes 😀"),
+                        file_identity: file_identity_text(
+                            read_file_at(
+                                &open_directory_path(Path::new(&root)).unwrap(),
+                                Path::new("chapter.md"),
+                            )
+                            .unwrap()
+                            .1,
+                        ),
+                    }],
+                )
+                .unwrap();
+            assert!(
+                restarted
+                    .save_operation(&root, &token, &key)
+                    .unwrap()
+                    .is_none()
+            );
+            let operation = restarted
+                .save_operation(&root, &fresh_token, &key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(operation.document_id, 8);
+            assert_eq!(operation.recovery_checkpoint_durable, checkpoint);
+            assert_eq!(operation.selector_durable, selector);
+            let pending = restarted.latest(&root).unwrap().unwrap();
+            assert_eq!(
+                pending.buffers[0].reconciliation_operation_key.as_deref(),
+                Some(key.as_str())
+            );
+
+            // Restart convergence only advances the missing legs. Repeating it
+            // is idempotent and does not erase the historical dirty snapshot.
+            let hash = hash_content("new exact bytes 😀");
+            let first = restarted
+                .reconcile_save_checkpoint(
+                    &root,
+                    &fresh_token,
+                    &key,
+                    "chapter.md",
+                    8,
+                    1,
+                    1,
+                    hash.clone(),
+                )
+                .unwrap();
+            let second = restarted
+                .reconcile_save_checkpoint(&root, &fresh_token, &key, "chapter.md", 8, 1, 1, hash)
+                .unwrap();
+            assert!(first.recovery_checkpoint_durable && second.recovery_checkpoint_durable);
+            restarted
+                .mark_save_selector_durable(&root, &fresh_token, &key)
+                .unwrap();
+            restarted
+                .clear_save_operation_pending_metadata(&root, &fresh_token, &key)
+                .unwrap();
+            let finished = restarted
+                .save_operation(&root, &fresh_token, &key)
+                .unwrap()
+                .unwrap();
+            assert!(finished.recovery_checkpoint_durable && finished.selector_durable);
+            assert!(
+                restarted.test_snapshot_stats(&root).unwrap().0 >= 2,
+                "dirty recovery history is retained"
+            );
+            assert!(
+                restarted.latest(&root).unwrap().unwrap().buffers[0]
+                    .reconciliation_operation_key
+                    .is_none()
+            );
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_real_child_crash_campaign_recovers_only_committed_versions() {
+        let exe = env::current_exe().unwrap();
+        for (phase, new_is_allowed) in [
+            ("before-transaction", false),
+            ("after-payload", false),
+            ("retention", false),
+            ("after-commit", true),
+        ] {
+            let base = reliability_root(&format!("crash-{phase}"));
+            let _cleanup = ReliabilityCleanup(base.clone());
+            let project = base.join("project");
+            fs::create_dir(&project).unwrap();
+            let root = project.display().to_string();
+            let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+            db.write_snapshot(
+                &root,
+                None,
+                &recovery_buffer("crash.md", 1, 1, Some("old committed bytes")),
+            )
+            .unwrap();
+            let status = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "tests::recovery_child_crash_phase",
+                    "--nocapture",
+                ])
+                .env("AMTE_RECOVERY_CHILD_ROOT", &base)
+                .env("AMTE_RECOVERY_CHILD_PHASE", phase)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "child must be aborted at {phase}");
+            let restarted = RecoveryDb::for_config(&base.join("config")).unwrap();
+            restarted.integrity_check().unwrap();
+            let content = restarted.latest(&root).unwrap().unwrap().buffers[0]
+                .content
+                .clone()
+                .unwrap();
+            if new_is_allowed {
+                assert_eq!(content, "new committed bytes 😀");
+            } else {
+                assert_eq!(content, "old committed bytes");
+            }
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_concurrency_fault_capacity_and_corruption_campaign() {
+        use std::sync::{Arc, Barrier};
+        let base = reliability_root("concurrency");
+        let _cleanup = ReliabilityCleanup(base.clone());
+        let project = base.join("project");
+        fs::create_dir(&project).unwrap();
+        let root = project.display().to_string();
+        let db = Arc::new(RecoveryDb::for_config(&base.join("config")).unwrap());
+        let barrier = Arc::new(Barrier::new(9));
+        let mut writers = Vec::new();
+        for writer in 0..8u64 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let root = root.clone();
+            writers.push(thread::spawn(move || {
+                barrier.wait();
+                for version in 1..=8u64 {
+                    let mut buffer = recovery_buffer(
+                        &format!("writer-{writer}.md"),
+                        writer + 1,
+                        version,
+                        Some(&format!("writer={writer};version={version}")),
+                    );
+                    buffer.client_edit_version = version;
+                    db.write_snapshot(&root, None, &buffer).unwrap();
+                    assert!(db.latest(&root).unwrap().is_some());
+                }
+            }));
+        }
+        barrier.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        db.integrity_check().unwrap();
+        let restored = db.latest(&root).unwrap().unwrap();
+        assert_eq!(restored.buffers.len(), 8);
+        for writer in 0..8 {
+            assert_eq!(
+                restored
+                    .buffers
+                    .iter()
+                    .find(|buffer| buffer.relative_path.as_deref()
+                        == Some(format!("writer-{writer}.md").as_str()))
+                    .and_then(|buffer| buffer.content.as_deref()),
+                Some(format!("writer={writer};version=8").as_str())
+            );
+        }
+
+        db.write_snapshot(
+            &root,
+            None,
+            &recovery_buffer("same.md", 99, 1, Some("same-v1")),
+        )
+        .unwrap();
+        let same_barrier = Arc::new(Barrier::new(3));
+        let mut same_writers = Vec::new();
+        for version in [2u64, 3] {
+            let db = db.clone();
+            let root = root.clone();
+            let barrier = same_barrier.clone();
+            same_writers.push(thread::spawn(move || {
+                barrier.wait();
+                let mut buffer =
+                    recovery_buffer("same.md", 99, version, Some(&format!("same-v{version}")));
+                buffer.client_edit_version = version;
+                db.write_snapshot(&root, None, &buffer)
+            }));
+        }
+        same_barrier.wait();
+        let a = same_writers.remove(0).join().unwrap();
+        let b = same_writers.remove(0).join().unwrap();
+        let sequences = [
+            a.ok().map(|ack| ack.recovery_sequence),
+            b.ok().map(|ack| ack.recovery_sequence),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        assert!(!sequences.is_empty() && sequences.windows(2).all(|pair| pair[0] != pair[1]));
+        assert_eq!(
+            db.latest(&root)
+                .unwrap()
+                .unwrap()
+                .buffers
+                .iter()
+                .find(|buffer| buffer.relative_path.as_deref() == Some("same.md"))
+                .and_then(|buffer| buffer.content.as_deref()),
+            Some("same-v3")
+        );
+
+        for failure in [
+            recovery_db::SnapshotInjectedFailure::FullBeforeTransaction,
+            recovery_db::SnapshotInjectedFailure::IoAfterPayload,
+            recovery_db::SnapshotInjectedFailure::BusyDuringRetention,
+        ] {
+            recovery_db::set_snapshot_injected_failure(Some(failure));
+            let result = db.write_snapshot(
+                &root,
+                None,
+                &recovery_buffer("writer-0.md", 1, 9, Some("must roll back")),
+            );
+            assert!(result.unwrap_err().contains("Injected SQLITE"));
+            assert_eq!(
+                db.latest(&root)
+                    .unwrap()
+                    .unwrap()
+                    .buffers
+                    .iter()
+                    .find(|buffer| buffer.relative_path.as_deref() == Some("writer-0.md"))
+                    .and_then(|buffer| buffer.content.as_deref()),
+                Some("writer=0;version=8")
+            );
+            db.integrity_check().unwrap();
+        }
+
+        // Twenty retained revisions plus a protected latest dirty snapshot are
+        // bounded by the policy, and the aggregate remains below the configured cap.
+        for version in 9..=36u64 {
+            let mut buffer = recovery_buffer(
+                "writer-0.md",
+                1,
+                version,
+                Some(&format!("retention-{version}")),
+            );
+            buffer.client_edit_version = version;
+            db.write_snapshot(&root, None, &buffer).unwrap();
+        }
+        let (rows, sequence, bytes) = db.test_snapshot_stats(&root).unwrap();
+        assert!(rows <= 8 * 20 + 1 && sequence >= 36 && bytes as usize <= RECOVERY_MAX_TOTAL_BYTES);
+
+        let original = db.test_path();
+        let corrupt_base = reliability_root("corrupt-copy");
+        let _corrupt_cleanup = ReliabilityCleanup(corrupt_base.clone());
+        let corrupt_dir = corrupt_base.join("config/recovery-v2");
+        fs::create_dir_all(&corrupt_dir).unwrap();
+        let corrupt = corrupt_dir.join("recovery.sqlite3");
+        fs::copy(&original, &corrupt).unwrap();
+        fs::write(&corrupt, b"not a sqlite database").unwrap();
+        let bytes_before = fs::read(&corrupt).unwrap();
+        assert!(RecoveryDb::for_config(&corrupt_base.join("config")).is_err());
+        assert_eq!(
+            fs::read(&corrupt).unwrap(),
+            bytes_before,
+            "corrupt main DB is never reinitialized"
+        );
+        let mismatch_base = reliability_root("wal-mismatch");
+        let _mismatch_cleanup = ReliabilityCleanup(mismatch_base.clone());
+        let mismatch_dir = mismatch_base.join("config/recovery-v2");
+        fs::create_dir_all(&mismatch_dir).unwrap();
+        fs::copy(&original, mismatch_dir.join("recovery.sqlite3")).unwrap();
+        fs::write(
+            mismatch_dir.join("recovery.sqlite3-wal"),
+            b"mismatched wal bytes",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                mismatch_dir.join("recovery.sqlite3-wal"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        assert!(
+            RecoveryDb::for_config(&mismatch_base.join("config")).is_err(),
+            "mismatched WAL must fail closed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let private = base.join("config/recovery-v2");
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                RecoveryDb::for_config(&base.join("config"))
+                    .unwrap_err()
+                    .contains("owner-private")
+            );
+        }
+        fs::remove_dir_all(corrupt_base).unwrap();
+        fs::remove_dir_all(mismatch_base).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn staged_save_faults_keep_exact_old_or_new_bytes_and_recovery() {
+        for (fault, new_expected) in [
+            (secure_fs::SaveFault::BeforeStageWrite, false),
+            (secure_fs::SaveFault::AfterStageFsync, false),
+            (secure_fs::SaveFault::BeforeRename, false),
+            (secure_fs::SaveFault::AfterRenameAckLoss, true),
+            (secure_fs::SaveFault::DirectoryFsync, true),
+        ] {
+            let base = reliability_root(&format!("save-{fault:?}"));
+            let _cleanup = ReliabilityCleanup(base.clone());
+            let project = base.join("project");
+            fs::create_dir(&project).unwrap();
+            let target = project.join("chapter.md");
+            fs::write(&target, "old exact bytes\n😀").unwrap();
+            let fd = open_directory_path(&project).unwrap();
+            let expected = read_file_at(&fd, Path::new("chapter.md")).unwrap().1;
+            let root = project.display().to_string();
+            let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+            db.write_snapshot(
+                &root,
+                None,
+                &recovery_buffer("chapter.md", 1, 1, Some("new exact bytes\n😀")),
+            )
+            .unwrap();
+            secure_fs::set_save_fault(Some(fault));
+            assert!(
+                write_file_at(
+                    &fd,
+                    Path::new("chapter.md"),
+                    "new exact bytes\n😀",
+                    Some(expected),
+                    false
+                )
+                .is_err()
+            );
+            assert_eq!(
+                fs::read_to_string(&target).unwrap(),
+                if new_expected {
+                    "new exact bytes\n😀"
+                } else {
+                    "old exact bytes\n😀"
+                }
+            );
+            assert_eq!(
+                db.latest(&root).unwrap().unwrap().buffers[0]
+                    .content
+                    .as_deref(),
+                Some("new exact bytes\n😀")
+            );
+            assert!(
+                !fs::read_dir(&project)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".amte-write-"))
+            );
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn discarded_binding_reopens_as_fresh_session_without_restoring_old_bytes() {
+        let base = temp("discard-reopen");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+        let mut old = recovery_buffer("chapter.md", 1, 1, Some("discarded draft"));
+        old.client_edit_version = 1;
+        db.write_snapshot(&canonical, None, &old).unwrap();
+        db.record_discard(&canonical).unwrap();
+        db.rebind_session_binding(&canonical, "chapter.md", 2)
+            .unwrap();
+        let mut fresh = recovery_buffer("chapter.md", 2, 1, Some("fresh draft"));
+        fresh.client_edit_version = 1;
+        db.write_snapshot(&canonical, None, &fresh).unwrap();
+        let restored = db.latest(&canonical).unwrap().unwrap();
+        assert_eq!(restored.buffers.len(), 1);
+        assert_eq!(restored.buffers[0].document_id, Some(2));
+        assert_eq!(restored.buffers[0].content.as_deref(), Some("fresh draft"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn normal_reopen_rebinds_fresh_ids_tokens_and_bounded_current_buffers() {
+        let base = temp("normal-reopen-fresh-binding");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("clean.md"), "current clean disk").unwrap();
+        fs::write(root.join("dirty.md"), "changed after close").unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+
+        let mut clean = recovery_buffer("clean.md", 41, 3, None);
+        clean.client_edit_version = 1;
+        clean.baseline_hash = Some(hash_content("old clean disk"));
+        db.write_snapshot(&canonical, None, &clean).unwrap();
+        let mut dirty = recovery_buffer("dirty.md", 42, 4, Some("retained draft"));
+        dirty.client_edit_version = 1;
+        dirty.baseline_hash = Some(hash_content("old dirty disk"));
+        dirty.source_scroll = Some(RecoveryScroll {
+            top: 17.0,
+            left: 3.0,
+        });
+        dirty.selection = Some(RecoverySelection { anchor: 2, head: 8 });
+        dirty.preview_scroll = Some(9.0);
+        dirty.previewing = Some(true);
+        dirty.search_term = Some("retained".into());
+        dirty.chapter_identity = Some("h2:0123456789abcdef:1".into());
+        dirty.chapter_scroll = Some(11.0);
+        dirty.collapsed_chapter_identities = Some(vec!["h2:0123456789abcdef:1".into()]);
+        dirty.activity = Some(RecoveryActivity {
+            day: "2026-11-01".into(),
+            added: 2,
+            deleted: 1,
+        });
+        db.write_snapshot(&canonical, None, &dirty).unwrap();
+
+        let authority = ProjectAuthority::default();
+        let first = restore_recovery_v2(
+            &authority,
+            Path::new(&canonical),
+            db.latest(&canonical).unwrap().unwrap(),
+            &[],
+        )
+        .unwrap();
+        let first_clean = first
+            .documents
+            .iter()
+            .find(|item| item.relative_path.as_deref() == Some("clean.md"))
+            .unwrap();
+        let first_dirty = first
+            .documents
+            .iter()
+            .find(|item| item.relative_path.as_deref() == Some("dirty.md"))
+            .unwrap();
+        assert_ne!(first_clean.document_id, Some(41));
+        assert_ne!(first_dirty.document_id, Some(42));
+        assert_eq!(first_clean.content, "current clean disk");
+        assert!(first_clean.conflict.is_none());
+        assert_eq!(first_dirty.content, "retained draft");
+        assert!(
+            first_dirty
+                .conflict
+                .as_deref()
+                .is_some_and(|error| error.starts_with("CONFLICT:"))
+        );
+        assert_eq!(
+            first_dirty
+                .recovery
+                .as_ref()
+                .unwrap()
+                .selection
+                .as_ref()
+                .unwrap()
+                .head,
+            8
+        );
+        assert_eq!(
+            first_dirty
+                .recovery
+                .as_ref()
+                .unwrap()
+                .search_term
+                .as_deref(),
+            Some("retained")
+        );
+        let dirty_ui = first_dirty.recovery.as_ref().unwrap();
+        assert_eq!(
+            dirty_ui
+                .source_scroll
+                .as_ref()
+                .map(|scroll| (scroll.top, scroll.left)),
+            Some((17.0, 3.0))
+        );
+        assert_eq!(dirty_ui.preview_scroll, Some(9.0));
+        assert_eq!(dirty_ui.previewing, Some(true));
+        assert_eq!(
+            dirty_ui.chapter_identity.as_deref(),
+            Some("h2:0123456789abcdef:1")
+        );
+        assert_eq!(dirty_ui.chapter_scroll, Some(11.0));
+        assert_eq!(
+            dirty_ui.collapsed_chapter_identities.as_ref().unwrap(),
+            &vec!["h2:0123456789abcdef:1".to_string()]
+        );
+        assert_eq!(
+            dirty_ui.activity.as_ref().map(|activity| (
+                activity.day.as_str(),
+                activity.added,
+                activity.deleted
+            )),
+            Some(("2026-11-01", 2, 1))
+        );
+        bind_restored_recovery_v2(&db, &first).unwrap();
+
+        let current = db.latest(&canonical).unwrap().unwrap();
+        assert_eq!(current.buffers.len(), 2, "one current buffer per path");
+        let rebound_clean = current
+            .buffers
+            .iter()
+            .find(|item| item.relative_path.as_deref() == Some("clean.md"))
+            .unwrap();
+        assert_eq!(rebound_clean.document_id, first_clean.document_id);
+        assert!(!rebound_clean.dirty);
+        assert_eq!(
+            rebound_clean.baseline_hash.as_deref(),
+            Some(hash_content("current clean disk").as_str())
+        );
+        let rebound_dirty = current
+            .buffers
+            .iter()
+            .find(|item| item.relative_path.as_deref() == Some("dirty.md"))
+            .unwrap();
+        assert_eq!(rebound_dirty.document_id, first_dirty.document_id);
+        assert_eq!(rebound_dirty.content.as_deref(), Some("retained draft"));
+
+        let mut stale = recovery_buffer("dirty.md", 42, 5, Some("must reject old ID"));
+        stale.client_edit_version = 2;
+        stale.baseline_hash = Some(hash_content("old dirty disk"));
+        assert!(
+            db.write_snapshot_for_session(&canonical, None, &first.project.session_token, &stale)
+                .is_err()
+        );
+        let mut fresh = recovery_buffer(
+            "dirty.md",
+            first_dirty.document_id.unwrap(),
+            5,
+            Some("new current draft"),
+        );
+        fresh.client_edit_version = 2;
+        fresh.baseline_hash = Some(hash_content("old dirty disk"));
+        db.write_snapshot_for_session(&canonical, None, &first.project.session_token, &fresh)
+            .unwrap();
+
+        let second = restore_recovery_v2(
+            &authority,
+            Path::new(&canonical),
+            db.latest(&canonical).unwrap().unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert_ne!(second.project.session_token, first.project.session_token);
+        for document in &second.documents {
+            let first_id = first
+                .documents
+                .iter()
+                .find(|item| item.relative_path == document.relative_path)
+                .and_then(|item| item.document_id);
+            assert_ne!(
+                document.document_id, first_id,
+                "each re-open mints a fresh document ID"
+            );
+        }
+        bind_restored_recovery_v2(&db, &second).unwrap();
+        assert!(
+            db.write_snapshot_for_session(&canonical, None, &first.project.session_token, &fresh)
+                .is_err()
+        );
+        let restored_twice = db.latest(&canonical).unwrap().unwrap();
+        assert_eq!(
+            restored_twice.buffers.len(),
+            2,
+            "re-open does not duplicate visible paths"
+        );
+        assert!(
+            db.test_snapshot_stats(&canonical).unwrap().0 <= 24,
+            "retired snapshot retention is bounded"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn empty_v2_project_row_does_not_poison_pending_legacy_import() {
+        let base = temp("empty-v2-row");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+        db.set_active_path(&canonical, Some("chapter.md")).unwrap();
+        assert!(
+            !db.has_committed_recovery_or_terminal_migration(&canonical)
+                .unwrap()
+        );
+        let directory = base.join(RecoveryStore::project_key(&canonical));
+        let store = RecoveryStore {
+            base: base.clone(),
+            manifest: directory.join("manifest.json"),
+            directory,
+        };
+        let mut legacy = recovery_buffer("chapter.md", 1, 1, Some("legacy"));
+        legacy.client_edit_version = 0;
+        write_recovery_transaction(&store, &canonical, legacy).unwrap();
+        let restored = restore_v2_before_legacy(&db, &canonical, || {
+            import_legacy_recovery_store_once(&store, &db, &canonical)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.buffers[0].content.as_deref(), Some("legacy"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn backend_clean_checkpoint_is_idempotent_and_never_hides_newer_dirty() {
+        let base = temp("clean-checkpoint");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+        let mut dirty = recovery_buffer("chapter.md", 1, 1, Some("saved bytes"));
+        dirty.client_edit_version = 1;
+        db.write_snapshot(&canonical, None, &dirty).unwrap();
+        let document = ActiveDocument {
+            relative_path: PathBuf::from("chapter.md"),
+            identity: 1,
+            file_identity: FileIdentity {
+                device: 1,
+                inode: 1,
+            },
+            write_revision: 1,
+            baseline_hash: hash_content("saved bytes"),
+        };
+        // Repeating this models response/ack loss after file and checkpoint commit.
+        backend_clean_checkpoint(&db, &canonical, &document, 1).unwrap();
+        backend_clean_checkpoint(&db, &canonical, &document, 1).unwrap();
+        let mut newer = recovery_buffer("chapter.md", 1, 2, Some("newer dirty"));
+        newer.client_edit_version = 2;
+        db.write_snapshot(&canonical, None, &newer).unwrap();
+        assert!(
+            backend_clean_checkpoint(&db, &canonical, &document, 1)
+                .unwrap_err()
+                .contains("Stale")
+        );
+        assert_eq!(
+            db.latest(&canonical).unwrap().unwrap().buffers[0]
+                .content
+                .as_deref(),
+            Some("newer dirty")
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn session_fence_barrier_rejects_validated_dirty_writer_after_discard() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let base = temp("session-fence-discard");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let db = Arc::new(RecoveryDb::for_config(&base.join("config")).unwrap());
+        let token = "a".repeat(64);
+        db.activate_session(&canonical, &token).unwrap();
+        db.rebind_session_binding(&canonical, "draft.md", 7)
+            .unwrap();
+        let barrier = Arc::new(recovery_db::SessionFenceBarrier {
+            root: canonical.clone(),
+            token: token.clone(),
+            reached: Barrier::new(2),
+            resume: Barrier::new(2),
+        });
+        recovery_db::set_session_fence_barrier(Some(barrier.clone()));
+        let writer_db = db.clone();
+        let writer_root = canonical.clone();
+        let writer_token = token.clone();
+        let writer = thread::spawn(move || {
+            let mut dirty = recovery_buffer("draft.md", 7, 1, Some("must not commit"));
+            dirty.client_edit_version = 1;
+            writer_db.write_snapshot_for_session(&writer_root, None, &writer_token, &dirty)
+        });
+        barrier.reached.wait();
+
+        // The test-only fence is global to the process, but it must never
+        // capture a normal writer from another recovery authority. A bounded
+        // completion assertion turns the historical suite-order hang into a
+        // deterministic regression failure.
+        let unrelated_base = temp("session-fence-unrelated");
+        let unrelated_root = unrelated_base.join("project");
+        fs::create_dir(&unrelated_root).unwrap();
+        let unrelated_canonical = unrelated_root.canonicalize().unwrap().display().to_string();
+        let unrelated_db = RecoveryDb::for_config(&unrelated_base.join("config")).unwrap();
+        let unrelated_token = "b".repeat(64);
+        unrelated_db
+            .write_snapshot(
+                &unrelated_canonical,
+                None,
+                &recovery_buffer("other.md", 1, 1, Some("prior writer")),
+            )
+            .unwrap();
+        unrelated_db
+            .activate_session(&unrelated_canonical, &unrelated_token)
+            .unwrap();
+        unrelated_db
+            .rebind_session_binding(&unrelated_canonical, "other.md", 8)
+            .unwrap();
+        let (unrelated_done, unrelated_result) = mpsc::channel();
+        let unrelated_writer = thread::spawn(move || {
+            let mut dirty = recovery_buffer("other.md", 8, 2, Some("unrelated writer"));
+            dirty.client_edit_version = 2;
+            unrelated_done
+                .send(unrelated_db.write_snapshot_for_session(
+                    &unrelated_canonical,
+                    None,
+                    &unrelated_token,
+                    &dirty,
+                ))
+                .unwrap();
+        });
+        assert!(
+            unrelated_result
+                .recv_timeout(Duration::from_secs(1))
+                .expect("unrelated session must not wait at the scoped fence")
+                .is_ok()
+        );
+        unrelated_writer.join().unwrap();
+        fs::remove_dir_all(unrelated_base).unwrap();
+
+        db.deactivate_and_discard_session(&canonical, &token)
+            .unwrap();
+        barrier.resume.wait();
+        assert!(writer.join().unwrap().is_err());
+        recovery_db::set_session_fence_barrier(None);
+        assert_eq!(db.test_snapshot_stats(&canonical).unwrap().0, 0);
+        assert!(db.latest(&canonical).unwrap().unwrap().buffers.is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn stale_discard_waiting_across_reopen_preserves_new_session_recovery() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let base = temp("stale-discard-reopen");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let db = Arc::new(RecoveryDb::for_config(&base.join("config")).unwrap());
+        let old_token = "d".repeat(64);
+        let new_token = "e".repeat(64);
+        db.write_snapshot(
+            &canonical,
+            None,
+            &recovery_buffer("draft.md", 1, 1, Some("old")),
+        )
+        .unwrap();
+        db.activate_session(&canonical, &old_token).unwrap();
+        db.rebind_session_binding(&canonical, "draft.md", 7)
+            .unwrap();
+        let mut old = recovery_buffer("draft.md", 7, 2, Some("old dirty"));
+        old.client_edit_version = 2;
+        db.write_snapshot_for_session(&canonical, None, &old_token, &old)
+            .unwrap();
+
+        let barrier = Arc::new(recovery_db::DiscardSessionBarrier {
+            root: canonical.clone(),
+            token: old_token.clone(),
+            reached: Barrier::new(2),
+            resume: Barrier::new(2),
+        });
+        recovery_db::set_discard_session_barrier(Some(barrier.clone()));
+        let old_db = db.clone();
+        let old_root = canonical.clone();
+        let old_capability = old_token.clone();
+        let (done, result) = mpsc::channel();
+        let old_discard = thread::spawn(move || {
+            done.send(old_db.deactivate_and_discard_session(&old_root, &old_capability))
+                .unwrap();
+        });
+        barrier.reached.wait();
+
+        db.rebind_session_bindings_and_activate(&canonical, &new_token, &[("draft.md".into(), 8)])
+            .unwrap();
+        let mut replacement = recovery_buffer("draft.md", 8, 3, Some("new session dirty"));
+        replacement.client_edit_version = 3;
+        db.write_snapshot_for_session(&canonical, None, &new_token, &replacement)
+            .unwrap();
+        barrier.resume.wait();
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .contains("Stale or inactive")
+        );
+        old_discard.join().unwrap();
+        recovery_db::set_discard_session_barrier(None);
+
+        let recovered = db.latest(&canonical).unwrap().unwrap();
+        assert_eq!(recovered.buffers.len(), 1);
+        assert_eq!(recovered.buffers[0].document_id, Some(8));
+        assert_eq!(
+            recovered.buffers[0].content.as_deref(),
+            Some("new session dirty")
+        );
+        let connection = rusqlite::Connection::open(db.test_path()).unwrap();
+        let project_key = blake3::hash(canonical.as_bytes()).to_hex().to_string();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE project_key=?1 AND kind='terminal-discard'",
+                    [&project_key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+
+        db.deactivate_and_discard_session(&canonical, &new_token)
+            .unwrap();
+        assert!(db.latest(&canonical).unwrap().unwrap().buffers.is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn activation_gate_serializes_two_candidates_without_discard() {
+        use std::sync::mpsc;
+        let base = temp("activation-gate-race");
+        let old_root = base.join("old");
+        let first_root = base.join("first");
+        let second_root = base.join("second");
+        fs::create_dir(&old_root).unwrap();
+        fs::create_dir(&first_root).unwrap();
+        fs::create_dir(&second_root).unwrap();
+        let old = canonical_project_root(&old_root).unwrap();
+        let first = canonical_project_root(&first_root).unwrap();
+        let second = canonical_project_root(&second_root).unwrap();
+        let authority = Arc::new(authority(&old));
+        let old_token = authority
+            .0
+            .lock()
+            .unwrap()
+            .project
+            .as_ref()
+            .unwrap()
+            .session_token
+            .clone();
+        let db = Arc::new(RecoveryDb::for_config(&base.join("config")).unwrap());
+        db.activate_session(&old.display().to_string(), &old_token)
+            .unwrap();
+        let gate = Arc::new(ActivationAuthority::default());
+        let reached = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let (first_started, started) = mpsc::channel();
+
+        let first_db = db.clone();
+        let first_gate = gate.clone();
+        let first_authority = authority.clone();
+        let first_reached = reached.clone();
+        let first_resume = resume.clone();
+        let old_root_text = old.display().to_string();
+        let first_root_text = first.display().to_string();
+        let old_for_first = old.clone();
+        let first_path = first.clone();
+        let expected_first = first.clone();
+        let first_worker = thread::spawn(move || {
+            let _gate = first_gate.0.lock().unwrap();
+            first_started.send(()).unwrap();
+            first_reached.wait();
+            first_resume.wait();
+            let token = "1".repeat(64);
+            first_db
+                .transition_active_session(
+                    Some((&old_root_text, &old_token)),
+                    &first_root_text,
+                    &token,
+                )
+                .unwrap();
+            let mut state = first_authority.0.lock().unwrap();
+            state.project = Some(ActiveProject {
+                root: first_path.clone(),
+                root_fd: Arc::new(open_directory_path(&first_path).unwrap()),
+                identity: 101,
+                session_token: token.clone(),
+                documents: HashMap::new(),
+                paths: HashMap::new(),
+            });
+            (token, old_for_first)
+        });
+        started.recv().unwrap();
+
+        let second_db = db.clone();
+        let second_gate = gate.clone();
+        let second_authority = authority.clone();
+        let second_root_text = second.display().to_string();
+        let old_root_text = old.display().to_string();
+        let old_token_for_second = authority
+            .0
+            .lock()
+            .unwrap()
+            .project
+            .as_ref()
+            .unwrap()
+            .session_token
+            .clone();
+        let second_worker = thread::spawn(move || {
+            let _gate = second_gate.0.lock().unwrap();
+            let token = "2".repeat(64);
+            let result = second_db.transition_active_session(
+                Some((&old_root_text, &old_token_for_second)),
+                &second_root_text,
+                &token,
+            );
+            // A loser must not replace or deactivate the winner's authority.
+            assert!(result.is_err());
+            assert_eq!(
+                second_authority
+                    .0
+                    .lock()
+                    .unwrap()
+                    .project
+                    .as_ref()
+                    .unwrap()
+                    .root,
+                expected_first
+            );
+        });
+        reached.wait();
+        resume.wait();
+        let (winner, _) = first_worker.join().unwrap();
+        second_worker.join().unwrap();
+        assert_eq!(
+            db.test_active_session_token(&first.display().to_string())
+                .unwrap(),
+            Some(winner.clone())
+        );
+        assert_eq!(
+            authority
+                .0
+                .lock()
+                .unwrap()
+                .project
+                .as_ref()
+                .unwrap()
+                .session_token,
+            winner
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn activation_gate_rolls_back_injected_failure_then_allows_discard_winner() {
+        use std::sync::mpsc;
+        let base = temp("activation-gate-failure");
+        let old_root = base.join("old");
+        let failed_root = base.join("failed");
+        let winner_root = base.join("winner");
+        fs::create_dir(&old_root).unwrap();
+        fs::create_dir(&failed_root).unwrap();
+        fs::create_dir(&winner_root).unwrap();
+        let old = canonical_project_root(&old_root).unwrap();
+        let failed = canonical_project_root(&failed_root).unwrap();
+        let winner_root = canonical_project_root(&winner_root).unwrap();
+        let authority = Arc::new(authority(&old));
+        let old_token = authority
+            .0
+            .lock()
+            .unwrap()
+            .project
+            .as_ref()
+            .unwrap()
+            .session_token
+            .clone();
+        let db = Arc::new(RecoveryDb::for_config(&base.join("config")).unwrap());
+        let old_text = old.display().to_string();
+        db.activate_session(&old_text, &old_token).unwrap();
+        db.write_snapshot(
+            &old_text,
+            None,
+            &recovery_buffer("draft.md", 1, 1, Some("keep or discard exactly once")),
+        )
+        .unwrap();
+        let gate = Arc::new(ActivationAuthority::default());
+        let transitioned = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let failed_db = db.clone();
+        let failed_gate = gate.clone();
+        let failed_old = old_text.clone();
+        let failed_root_text = failed.display().to_string();
+        let failed_token = old_token.clone();
+        let failed_transitioned = transitioned.clone();
+        let failed_resume = resume.clone();
+        let failed_worker = thread::spawn(move || {
+            let _gate = failed_gate.0.lock().unwrap();
+            started_tx.send(()).unwrap();
+            let token = "3".repeat(64);
+            failed_db
+                .transition_active_session(
+                    Some((&failed_old, &failed_token)),
+                    &failed_root_text,
+                    &token,
+                )
+                .unwrap();
+            failed_transitioned.wait();
+            failed_resume.wait();
+            // Inject selector persistence failure: rollback must restore the
+            // still-live old token before releasing the gate.
+            failed_db
+                .rollback_activation_session(
+                    Some((&failed_old, &failed_token)),
+                    &failed_root_text,
+                    &token,
+                )
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        transitioned.wait();
+
+        let winner_db = db.clone();
+        let winner_gate = gate.clone();
+        let winner_authority = authority.clone();
+        let winner_old = old_text.clone();
+        let winner_old_token = old_token.clone();
+        let winner_root_text = winner_root.display().to_string();
+        let winner_path = winner_root.clone();
+        let winner_worker = thread::spawn(move || {
+            let _gate = winner_gate.0.lock().unwrap();
+            let token = "4".repeat(64);
+            winner_db
+                .transition_active_session(
+                    Some((&winner_old, &winner_old_token)),
+                    &winner_root_text,
+                    &token,
+                )
+                .unwrap();
+            winner_db
+                .finalize_activation_discard(
+                    Some((&winner_old, &winner_old_token)),
+                    &winner_root_text,
+                    &token,
+                )
+                .unwrap();
+            winner_authority.0.lock().unwrap().project = Some(ActiveProject {
+                root: winner_path.clone(),
+                root_fd: Arc::new(open_directory_path(&winner_path).unwrap()),
+                identity: 102,
+                session_token: token.clone(),
+                documents: HashMap::new(),
+                paths: HashMap::new(),
+            });
+            token
+        });
+        resume.wait();
+        failed_worker.join().unwrap();
+        let winner = winner_worker.join().unwrap();
+        assert_eq!(
+            db.test_active_session_token(&winner_root.display().to_string())
+                .unwrap(),
+            Some(winner.clone())
+        );
+        assert_eq!(
+            authority
+                .0
+                .lock()
+                .unwrap()
+                .project
+                .as_ref()
+                .unwrap()
+                .session_token,
+            winner
+        );
+        assert!(
+            db.latest(&old_text).unwrap().unwrap().buffers.is_empty(),
+            "only the successful discard may remove old buffers"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn picker_publication_waits_for_discarding_activation_then_becomes_next_candidate() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let base = temp("picker-activation-interleaving");
+        let old_root = base.join("old");
+        let first_root = base.join("first");
+        let second_root = base.join("second");
+        fs::create_dir(&old_root).unwrap();
+        fs::create_dir(&first_root).unwrap();
+        fs::create_dir(&second_root).unwrap();
+        let old = canonical_project_root(&old_root).unwrap();
+        let first = canonical_project_root(&first_root).unwrap();
+        let second = canonical_project_root(&second_root).unwrap();
+        let authority = Arc::new(authority(&old));
+        let gate = Arc::new(ActivationAuthority::default());
+
+        // Picker A completes before activation starts. Its ID is the exact
+        // generation activation must retain through terminal discard.
+        let first_candidate = publish_picked_project(&authority, &gate, first.clone()).unwrap();
+        let (activation_ready_tx, activation_ready_rx) = mpsc::channel();
+        let (resume_activation_tx, resume_activation_rx) = mpsc::channel();
+        let activation_authority = authority.clone();
+        let activation_gate = gate.clone();
+        let activation_root = first.clone();
+        let activation_candidate_id = first_candidate.candidate_id;
+        let activation = thread::spawn(move || {
+            let _activation = activation_gate.0.lock().unwrap();
+            {
+                let state = activation_authority.0.lock().unwrap();
+                assert_eq!(
+                    state.pending_project.as_ref().map(|(id, _)| *id),
+                    Some(activation_candidate_id),
+                    "A captures its candidate while holding the activation gate"
+                );
+            }
+            activation_ready_tx.send(()).unwrap();
+            // This is the deterministic pause immediately around the terminal
+            // discard boundary. Picker B may have fully validated its folder,
+            // but must not publish while A owns the gate.
+            resume_activation_rx.recv().unwrap();
+
+            // Model the post-discard authority swap: no candidate lookup or
+            // fallible candidate check occurs after this point.
+            let mut state = activation_authority.0.lock().unwrap();
+            let identity = ProjectAuthority::next_id(&mut state);
+            let session_token = ProjectAuthority::session_token(&activation_root, identity);
+            state.pending_project.take();
+            state.project = Some(ActiveProject {
+                root: activation_root.clone(),
+                root_fd: Arc::new(open_directory_path(&activation_root).unwrap()),
+                identity,
+                session_token,
+                documents: HashMap::new(),
+                paths: HashMap::new(),
+            });
+        });
+        activation_ready_rx.recv().unwrap();
+
+        let (picker_started_tx, picker_started_rx) = mpsc::channel();
+        let (picker_done_tx, picker_done_rx) = mpsc::channel();
+        let picker_authority = authority.clone();
+        let picker_gate = gate.clone();
+        let expected_second = second.clone();
+        let picker = thread::spawn(move || {
+            picker_started_tx.send(()).unwrap();
+            picker_done_tx
+                .send(publish_picked_project(
+                    &picker_authority,
+                    &picker_gate,
+                    second,
+                ))
+                .unwrap();
+        });
+        picker_started_rx.recv().unwrap();
+        assert!(
+            picker_done_rx.try_recv().is_err(),
+            "picker B must wait while A is paused at discard"
+        );
+
+        resume_activation_tx.send(()).unwrap();
+        activation.join().unwrap();
+        let second_candidate = picker_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("picker B must finish once A releases the gate")
+            .unwrap();
+        picker.join().unwrap();
+
+        let state = authority.0.lock().unwrap();
+        assert_eq!(state.project.as_ref().unwrap().root, first);
+        assert_eq!(
+            state.pending_project.as_ref().map(|(id, root)| (*id, root)),
+            Some((second_candidate.candidate_id, &expected_second))
+        );
+        assert_ne!(first_candidate.candidate_id, second_candidate.candidate_id);
+        drop(state);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cancelled_or_invalid_picker_never_changes_the_pending_candidate() {
+        let base = temp("picker-cancel-failure");
+        let old_root = base.join("old");
+        let pending_root = base.join("pending");
+        fs::create_dir(&old_root).unwrap();
+        fs::create_dir(&pending_root).unwrap();
+        let old = canonical_project_root(&old_root).unwrap();
+        let pending = canonical_project_root(&pending_root).unwrap();
+        let authority = ProjectAuthority::default();
+        authority.activate_project(old).unwrap();
+        let gate = ActivationAuthority::default();
+        let original = publish_picked_project(&authority, &gate, pending.clone()).unwrap();
+
+        // `pick_project` returns before publication on cancellation, and an
+        // invalid selection fails canonical validation before it reaches the
+        // publication helper.
+        let cancelled: Option<PathBuf> = None;
+        assert!(cancelled.is_none());
+        assert!(canonical_project_root(&base.join("missing")).is_err());
+
+        let state = authority.0.lock().unwrap();
+        assert_eq!(
+            state.project.as_ref().unwrap().root,
+            old_root.canonicalize().unwrap()
+        );
+        assert_eq!(
+            state.pending_project.as_ref().map(|(id, root)| (*id, root)),
+            Some((original.candidate_id, &pending))
+        );
+        drop(state);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn restart_rebinds_pending_save_as_without_picker_and_rejects_changed_disk() {
+        let base = temp("restart-save-as-rebind");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("saved.md"), "saved bytes 😀").unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+        let old_token = "a".repeat(64);
+        let fresh_token = "b".repeat(64);
+        let key = "c".repeat(64);
+        let content = "saved bytes 😀";
+        let hash = hash_content(content);
+        db.activate_session(&canonical, &old_token).unwrap();
+        let mut source = recovery_buffer("placeholder.md", 1, 4, Some(content));
+        source.relative_path = None;
+        source.document_id = None;
+        source.client_edit_version = 4;
+        source.baseline_hash = None;
+        db.write_snapshot_for_session(&canonical, None, &old_token, &source)
+            .unwrap();
+        let root_fd = open_directory_path(Path::new(&canonical)).unwrap();
+        let (_, identity) = read_file_at(&root_fd, Path::new("saved.md")).unwrap();
+        db.record_file_commit(
+            &canonical,
+            &old_token,
+            &key,
+            "__untitled__",
+            "saved.md",
+            81,
+            1,
+            4,
+            &hash,
+            &file_identity_text(identity),
+        )
+        .unwrap();
+        db.mark_save_operation_pending_metadata(&canonical, &old_token, &key)
+            .unwrap();
+
+        // This is the restart path: only the journal key and descriptor-read
+        // destination facts cross the process boundary; no picker is involved.
+        db.rebind_session_bindings_and_activate_with_operations(
+            &canonical,
+            &fresh_token,
+            &[],
+            &[recovery_db::SaveOperationRebind {
+                operation_key: key.clone(),
+                content_blake3: hash.clone(),
+                file_identity: file_identity_text(identity),
+            }],
+        )
+        .unwrap();
+        assert!(
+            db.save_operation(&canonical, &old_token, &key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.save_operation(&canonical, &fresh_token, &key)
+                .unwrap()
+                .is_some()
+        );
+        let transition = db
+            .reconcile_save_as_operation(&canonical, &fresh_token, &key)
+            .unwrap();
+        assert_eq!(transition.destination_document_id, 81);
+        let destination = db
+            .latest(&canonical)
+            .unwrap()
+            .unwrap()
+            .buffers
+            .into_iter()
+            .find(|buffer| buffer.relative_path.as_deref() == Some("saved.md"))
+            .unwrap();
+        assert_eq!(
+            destination.reconciliation_operation_key.as_deref(),
+            Some(key.as_str()),
+            "the destination, not the retired untitled source, owns restart reconciliation"
+        );
+        assert!(
+            db.save_operation(&canonical, &old_token, &key)
+                .unwrap()
+                .is_none(),
+            "the pre-restart token remains rejected"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+
+        let changed_base = temp("restart-save-disk-change");
+        let changed_root = changed_base.join("project");
+        fs::create_dir(&changed_root).unwrap();
+        fs::write(changed_root.join("chapter.md"), "committed bytes").unwrap();
+        let changed_canonical = changed_root.canonicalize().unwrap().display().to_string();
+        let changed = RecoveryDb::for_config(&changed_base.join("config")).unwrap();
+        let old = "d".repeat(64);
+        let fresh = "e".repeat(64);
+        let changed_key = "f".repeat(64);
+        changed
+            .write_snapshot(
+                &changed_canonical,
+                None,
+                &recovery_buffer("chapter.md", 1, 1, Some("committed bytes")),
+            )
+            .unwrap();
+        changed.activate_session(&changed_canonical, &old).unwrap();
+        changed
+            .rebind_session_binding(&changed_canonical, "chapter.md", 7)
+            .unwrap();
+        let mut pending = recovery_buffer("chapter.md", 7, 1, Some("committed bytes"));
+        pending.client_edit_version = 1;
+        pending.baseline_hash = Some(hash_content("before save"));
+        changed
+            .write_snapshot_for_session(&changed_canonical, None, &old, &pending)
+            .unwrap();
+        let changed_fd = open_directory_path(Path::new(&changed_canonical)).unwrap();
+        let (_, committed_identity) = read_file_at(&changed_fd, Path::new("chapter.md")).unwrap();
+        let committed_hash = hash_content("committed bytes");
+        changed
+            .record_file_commit(
+                &changed_canonical,
+                &old,
+                &changed_key,
+                "chapter.md",
+                "chapter.md",
+                7,
+                1,
+                1,
+                &committed_hash,
+                &file_identity_text(committed_identity),
+            )
+            .unwrap();
+        changed
+            .mark_save_operation_pending_metadata(&changed_canonical, &old, &changed_key)
+            .unwrap();
+        // This is the backend-to-frontend DTO boundary on restart: although
+        // the dirty draft baseline predates the committed disk bytes, the
+        // exact pending journal proves this is reconciliation, not conflict.
+        let restored_authority = ProjectAuthority::default();
+        let pending_operations = changed.pending_save_operations(&changed_canonical).unwrap();
+        let restored = restore_recovery_v2(
+            &restored_authority,
+            &changed_root,
+            changed.latest(&changed_canonical).unwrap().unwrap(),
+            &pending_operations,
+        )
+        .unwrap();
+        let restored_document = restored
+            .documents
+            .iter()
+            .find(|document| document.relative_path.as_deref() == Some("chapter.md"))
+            .unwrap();
+        assert!(restored_document.conflict.is_none());
+        assert_eq!(
+            restored_document
+                .recovery
+                .as_ref()
+                .and_then(|recovery| recovery.reconciliation_operation_key.as_deref()),
+            Some(changed_key.as_str())
+        );
+        bind_restored_recovery_v2(&changed, &restored).unwrap();
+        assert!(
+            changed
+                .save_operation(
+                    &changed_canonical,
+                    &restored.project.session_token,
+                    &changed_key
+                )
+                .unwrap()
+                .is_some(),
+            "the fresh frontend session receives the opaque reconciliation key"
+        );
+        fs::write(changed_root.join("chapter.md"), "external replacement").unwrap();
+        let (_, changed_identity) = read_file_at(&changed_fd, Path::new("chapter.md")).unwrap();
+        changed
+            .rebind_session_bindings_and_activate_with_operations(
+                &changed_canonical,
+                &fresh,
+                &[("chapter.md".into(), 8)],
+                &[recovery_db::SaveOperationRebind {
+                    operation_key: changed_key.clone(),
+                    content_blake3: hash_content("external replacement"),
+                    file_identity: file_identity_text(changed_identity),
+                }],
+            )
+            .unwrap();
+        assert!(
+            changed
+                .save_operation(
+                    &changed_canonical,
+                    &restored.project.session_token,
+                    &changed_key
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            changed
+                .save_operation(&changed_canonical, &fresh, &changed_key)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(changed_base).unwrap();
+    }
+
+    #[test]
+    fn save_snapshot_switched_before_checkpoint_cannot_apply_to_new_authority() {
+        let old_root = temp("snapshot-old");
+        let new_root = temp("snapshot-new");
+        fs::write(old_root.join("draft.md"), "old").unwrap();
+        let authority = authority(&old_root);
+        let (project_id, token, document_id) = {
+            let mut state = authority.0.lock().unwrap();
+            let project = state.project.as_ref().unwrap();
+            let (content, identity) =
+                read_file_at(&project.root_fd, Path::new("draft.md")).unwrap();
+            let id =
+                activate_document(&mut state, PathBuf::from("draft.md"), identity, &content, 0)
+                    .unwrap();
+            let project = state.project.as_ref().unwrap();
+            (project.identity, project.session_token.clone(), id)
+        };
+        let snapshot =
+            capture_authorization_snapshot(&authority, project_id, Some(&token), Some(document_id))
+                .unwrap();
+        let completed = persist_document_snapshot(&snapshot, 1, "saved before switch").unwrap();
+        authority
+            .activate_project(canonical_project_root(&new_root).unwrap())
+            .unwrap();
+        assert!(matches!(
+            apply_document_save(
+                &authority,
+                &snapshot,
+                &completed,
+                "saved before switch".into()
+            )
+            .unwrap(),
+            AuthorityApply::Stale
+        ));
+        let active = authority.0.lock().unwrap();
+        assert_eq!(
+            active.project.as_ref().unwrap().root,
+            canonical_project_root(&new_root).unwrap()
+        );
+        assert!(active.project.as_ref().unwrap().documents.is_empty());
+        drop(active);
+        fs::remove_dir_all(old_root).unwrap();
+        fs::remove_dir_all(new_root).unwrap();
+    }
+
+    #[test]
+    fn recovery_and_save_snapshot_protocol_completes_without_lock_inversion() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = temp("lock-order");
+        fs::write(root.join("draft.md"), "old").unwrap();
+        let authority = Arc::new(authority(&root));
+        let project = authority
+            .0
+            .lock()
+            .unwrap()
+            .project
+            .as_ref()
+            .unwrap()
+            .identity;
+        let recovery = Arc::new(RecoveryAuthority::default());
+        let start = Arc::new(Barrier::new(2));
+        let (done, receiver) = mpsc::channel();
+        for recovery_first in [false, true] {
+            let authority = authority.clone();
+            let recovery = recovery.clone();
+            let start = start.clone();
+            let done = done.clone();
+            thread::spawn(move || {
+                start.wait();
+                if recovery_first {
+                    let transaction = recovery.0.lock().unwrap();
+                    drop(transaction);
+                    let _ =
+                        capture_authorization_snapshot(&authority, project, None, None).unwrap();
+                } else {
+                    let _ =
+                        capture_authorization_snapshot(&authority, project, None, None).unwrap();
+                    let transaction = recovery.0.lock().unwrap();
+                    drop(transaction);
+                }
+                done.send(()).unwrap();
+            });
+        }
+        for _ in 0..2 {
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("snapshot/recovery protocol must not deadlock");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_recovery_writers_serialize_through_global_transaction_mutex() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lock = Arc::new(RecoveryAuthority::default());
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Barrier::new(3));
+        let mut writers = Vec::new();
+        for _ in 0..2 {
+            let lock = lock.clone();
+            let active = active.clone();
+            let maximum = maximum.clone();
+            let gate = gate.clone();
+            writers.push(thread::spawn(move || {
+                gate.wait();
+                let _transaction = lock.0.lock().unwrap();
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                thread::yield_now();
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        gate.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn save_as_recovery_transition_is_atomic_idempotent_and_retires_untitled() {
+        let base = temp("save-as-recovery-transition");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap().display().to_string();
+        let db = RecoveryDb::for_config(&base.join("config")).unwrap();
+        let token = "b".repeat(64);
+        db.activate_session(&canonical, &token).unwrap();
+        let mut source = recovery_buffer("placeholder.md", 1, 7, Some("untitled exact bytes"));
+        source.relative_path = None;
+        source.document_id = None;
+        source.client_edit_version = 7;
+        source.baseline_hash = None;
+        db.write_snapshot_for_session(&canonical, None, &token, &source)
+            .unwrap();
+        let hash = hash_content("untitled exact bytes");
+
+        // A pre-commit fault keeps the only ordinary-recovery binding untitled
+        // and dirty; restart observes no half-destination.
+        recovery_db::set_save_as_injected_fault(Some(
+            recovery_db::SaveAsInjectedFault::BeforeCommit,
+        ));
+        assert!(
+            db.save_as_transition(
+                &canonical,
+                &token,
+                &source,
+                "saved.md",
+                81,
+                7,
+                7,
+                hash.clone()
+            )
+            .is_err()
+        );
+        let before = RecoveryDb::for_config(&base.join("config"))
+            .unwrap()
+            .latest(&canonical)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.buffers.len(), 1);
+        assert!(before.buffers[0].dirty);
+        assert!(before.buffers[0].relative_path.is_none());
+
+        // Commit/ack loss returns an error, but the exact key returns the
+        // original destination identity rather than allocating a second row.
+        recovery_db::set_save_as_injected_fault(Some(
+            recovery_db::SaveAsInjectedFault::AfterCommitAckLoss,
+        ));
+        assert!(
+            db.save_as_transition(
+                &canonical,
+                &token,
+                &source,
+                "saved.md",
+                81,
+                7,
+                7,
+                hash.clone()
+            )
+            .is_err()
+        );
+        let retry = RecoveryDb::for_config(&base.join("config"))
+            .unwrap()
+            .save_as_transition(
+                &canonical,
+                &token,
+                &source,
+                "saved.md",
+                999,
+                7,
+                7,
+                hash.clone(),
+            )
+            .unwrap();
+        assert_eq!(retry.destination_document_id, 81);
+        assert!(
+            db.save_as_transition(&canonical, &token, &source, "other.md", 82, 7, 7, hash)
+                .unwrap_err()
+                .contains("does not match")
+        );
+
+        let restored = RecoveryDb::for_config(&base.join("config"))
+            .unwrap()
+            .latest(&canonical)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.active_path.as_deref(), Some("saved.md"));
+        assert_eq!(restored.buffers.len(), 1, "retired history is audit-only");
+        assert_eq!(
+            restored.buffers[0].relative_path.as_deref(),
+            Some("saved.md")
+        );
+        assert!(!restored.buffers[0].dirty);
+        assert_eq!(restored.buffers[0].document_id, Some(81));
+        assert_eq!(
+            restored.buffers[0].baseline_hash.as_deref(),
+            Some(hash_content("untitled exact bytes").as_str())
+        );
+
+        let connection = rusqlite::Connection::open(db.test_path()).unwrap();
+        let key = blake3::hash(canonical.as_bytes()).to_hex().to_string();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM save_as_transitions WHERE project_key=?1",
+                    [&key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM events WHERE project_key=?1 AND kind='save-as-transition'", [&key], |row| row.get::<_, i64>(0)).unwrap(), 1);
         fs::remove_dir_all(base).unwrap();
     }
 }

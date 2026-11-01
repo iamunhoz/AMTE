@@ -112,17 +112,19 @@ function createAutosaveController({ snapshot, write, onSuccess, onError, setInte
     work = (async () => {
       try {
       if (Array.isArray(pending)) {
+        const outcomes = {};
         for (const item of pending) {
-          try { onSuccess(item, await write(item)); } catch (error) { onError(error, item); }
+          try { const result = await write(item); onSuccess(item, result); outcomes[item.entry?.key || String(Object.keys(outcomes).length)] = { result }; } catch (error) { onError(error, item); outcomes[item.entry?.key || String(Object.keys(outcomes).length)] = { error: String(error) }; }
         }
-      } else onSuccess(pending, await write(pending));
+        return outcomes;
+      } else { const result = await write(pending); onSuccess(pending, result); return { [pending.entry?.key || 'active']: { result } }; }
       } catch (error) {
         onError(error);
       } finally {
         writeInFlight = false;
       }
     })();
-    try { await work; } finally { work = null; }
+    try { return await work; } finally { work = null; }
   }
 
   return {
@@ -331,6 +333,19 @@ async function start() {
   const documentShell = document.querySelector('#document-shell');
   const themeChrome = document.querySelector('#theme-chrome');
   const saveIndicator = createSaveIndicatorController({ element: document.querySelector('#save-indicator') });
+  function refreshSaveStatus(entry = buffers?.active?.()) {
+    if (!entry) return saveIndicator.update({});
+    return saveIndicator.update({
+      dirty: entry.dirty,
+      recoveryPending: entry.dirty && (entry.recoveryState === 'pending' || entry.recoveryState === 'persisting'),
+      recoveryDurable: entry.dirty && entry.recoveryState === 'durable',
+      fileSaving: entry.saving,
+      reconciliationPending: entry.reconciliationPending && !entry.reconciliationError,
+      reconciliationError: entry.reconciliationPending && Boolean(entry.reconciliationError),
+      error: Boolean(entry.recoveryError),
+      conflict: Boolean(entry.conflict),
+    });
+  }
   const boxFrames = new Set(document.querySelectorAll('.box-frame'));
   const root = document.documentElement;
   let previewing = false;
@@ -940,35 +955,42 @@ async function start() {
     entry.activity = dailyActivity.snapshot();
   }
 
-  async function persistRecovery(entry, sequence, binding) {
-    if (!entry || !binding?.projectId || !buffers.matchesBinding(entry, binding)) return;
-    const current = entry === buffers.active();
-    const state = current ? view.state : entry.state;
-    return invoke('write_recovery_buffer', {
+  async function persistRecovery(entry, snapshot, binding) {
+    if (!entry || !binding?.projectId || !binding?.sessionToken || !buffers.matchesBinding(entry, binding)) return;
+    const result = await invoke('write_recovery_buffer', {
       projectId: binding.projectId,
+      sessionToken: binding.sessionToken,
       buffer: {
-        relativePath: entry.relativePath, documentId: entry.documentId, writeRevision: entry.writeRevision, recoverySequence: sequence, dirty: entry.dirty,
-        content: entry.dirty ? state.doc.toString() : null, baselineHash: entry.baselineHash,
-        sourceScroll: entry.sourceScroll, selection: entry.selection, previewScroll: entry.previewScroll, previewing: entry.previewing,
-        searchTerm: entry.searchTerm, chapterIdentity: entry.chapterIdentity, chapterScroll: entry.chapterScroll,
-        collapsedChapterIdentities: entry.collapsedChapterIdentities,
-        activity: entry.activity,
+        relativePath: entry.relativePath, documentId: snapshot.documentId, writeRevision: snapshot.writeRevision,
+        clientEditVersion: snapshot.clientEditVersion, dirty: true,
+        content: snapshot.content, baselineHash: snapshot.baselineHash,
+        sourceScroll: snapshot.sourceScroll, selection: snapshot.selection, previewScroll: snapshot.previewScroll, previewing: snapshot.previewing,
+        searchTerm: snapshot.searchTerm, chapterIdentity: snapshot.chapterIdentity, chapterScroll: snapshot.chapterScroll,
+        collapsedChapterIdentities: snapshot.collapsedChapterIdentities,
+        activity: snapshot.activity,
+        reconciliationOperationKey: entry.reconciliationOperationKey,
+        reconciliationClientEditVersion: entry.reconciliationSnapshot?.clientEditVersion || null,
       },
     });
+    if (buffers.matchesBinding(entry, binding) && entry === buffers.active()) refreshSaveStatus(entry);
+    return result;
   }
   function scheduleRecovery(entry) {
-    if (!window.__TAURI__?.core) return;
+    // Browser benchmark mocks file writes but intentionally has no isolated
+    // recovery DB; never turn that harness limitation into a persistent UI
+    // error that masks the file-saved timer state machine.
+    if (browserCheckMode || !window.__TAURI__?.core) return;
     buffers.scheduleRecovery(entry, persistRecovery);
   }
   // Project-file writes alone reach this notifier. Recovery snapshots deliberately
-  // bypass it, and bindings reject stale or transitioned buffers.
+  // use their distinct durable state, and bindings reject stale transitions.
   function notifySuccessfulProjectWrite(entry, snapshot) {
     if (!buffers.matchesBinding(entry, snapshot)) return false;
-    saveIndicator.show();
+    if (!entry.reconciliationPending) saveIndicator.show();
     return true;
   }
   async function flushRecovery() {
-    if (buffers.persistenceSuppressed) return;
+    if (browserCheckMode || buffers.persistenceSuppressed) return;
     captureActiveBuffer();
     await buffers.flushRecovery(persistRecovery);
     const project = buffers.project;
@@ -1007,6 +1029,7 @@ async function start() {
     if (previewing) { void renderPreview(); requestFrame(() => { preview.scrollTop = entry.previewScroll || 0; }); }
     if (currentProject && entry.documentId) void invoke('revalidate_project_document', { projectId: currentProject.projectId, documentId: entry.documentId }).then((status) => { if (buffers.active() === entry && status.conflict) { entry.conflict = status.conflict; dirty = true; console.error(status.conflict); } }).catch(() => {});
     scheduleRecovery(entry);
+    refreshSaveStatus(entry);
   }
 
   view = new EditorView({ state: createState(''), parent: editorHost });
@@ -1167,31 +1190,109 @@ async function start() {
     if (!currentProject || !entry || entry.conflict) { if (entry?.conflict) console.error(entry.conflict); return false; }
     captureActiveBuffer();
     const isActive = entry === buffers.active();
-    const snapshot = buffers.writeSnapshot(entry); const savingUntitled = entry.documentId === null;
-    if (savingUntitled && !allowSaveAs) return false;
+    const savingUntitled = entry.documentId === null;
+    if (savingUntitled && !allowSaveAs && !entry.reconciliationPending) return false;
+    // Save As validates the durable untitled binding in its one post-rename
+    // authority transaction. Flush that source before presenting the picker;
+    // cancel still leaves the same untitled binding authoritative.
+    entry.saving = true; if (entry === buffers.active()) refreshSaveStatus(entry);
     try {
+      if (entry.reconciliationPending && entry.reconciliationOperationKey) {
+        return await reconcileSavedOperation(entry);
+      }
+      if (savingUntitled) await flushRecovery();
+      const pendingSnapshot = entry.reconciliationPending ? entry.reconciliationSnapshot : null;
+      const snapshot = pendingSnapshot && pendingSnapshot.content === entry.state.doc.toString()
+        ? pendingSnapshot
+        : buffers.writeSnapshot(entry);
       const saved = savingUntitled
-        ? await invoke('save_document_as', { projectId: currentProject.projectId, revision: snapshot.revision, content: snapshot.content })
-        : await invoke('save_document', { projectId: currentProject.projectId, documentId: entry.documentId, revision: snapshot.revision, content: snapshot.content });
-      if (!saved || !notifySuccessfulProjectWrite(entry, snapshot)) return false;
-      entry.documentId = saved.documentId; entry.relativePath = saved.relativePath; entry.baselineHash = saved.baselineHash;
+        ? await invoke('save_document_as', { projectId: currentProject.projectId, sessionToken: currentProject.sessionToken, revision: snapshot.revision, clientEditVersion: snapshot.clientEditVersion, content: snapshot.content, sourceRecovery: { relativePath: null, documentId: null, writeRevision: entry.writeRevision, clientEditVersion: snapshot.clientEditVersion, dirty: true, content: snapshot.content, baselineHash: entry.baselineHash, sourceScroll: entry.sourceScroll, selection: entry.selection, previewScroll: entry.previewScroll, previewing: entry.previewing, searchTerm: entry.searchTerm, chapterIdentity: entry.chapterIdentity, chapterScroll: entry.chapterScroll, collapsedChapterIdentities: [...entry.collapsedChapterIdentities], activity: entry.activity } })
+        : await invoke('save_document', { projectId: currentProject.projectId, sessionToken: currentProject.sessionToken, documentId: entry.documentId, revision: snapshot.revision, clientEditVersion: snapshot.clientEditVersion, content: snapshot.content });
+      if (!saved?.fileCommitted) {
+        entry.recoveryError = saved?.reconciliationErrorMessage || 'The file was not saved.';
+        return false;
+      }
+      const document = saved.document;
+      buffers.applySaveOutcome(entry, snapshot, saved);
+      if (!notifySuccessfulProjectWrite(entry, snapshot)) return false;
+      if (!document) {
+        scheduleSaveReconciliation(entry, allowSaveAs);
+        return false;
+      }
+      entry.documentId = document.documentId; entry.relativePath = document.relativePath; entry.baselineHash = document.baselineHash;
       if (savingUntitled) { buffers.entries.delete('__untitled__'); buffers.entries.set(entry.relativePath, entry); entry.key = entry.relativePath; if (isActive) buffers.activePath = entry.relativePath; }
-      buffers.applyWriteAck(entry, snapshot, saved);
       if (isActive) { currentRelativePath = entry.relativePath; currentPath = `${currentProject.root}/${entry.relativePath}`; currentDocumentId = entry.documentId; currentWriteRevision = entry.writeRevision; dirty = entry.dirty; if (savingUntitled) dailyActivity.adoptIdentity(currentPath); }
       if (treeNodes.has('')) { treeNodes.get('').loaded = false; await loadDirectory(''); }
       scheduleRecovery(entry); await flushRecovery();
-      return true;
-    } catch (error) { if (/CONFLICT/.test(String(error))) buffers.markConflict(entry, error); console.error('Could not save document:', error); return false; }
+      if (entry.reconciliationPending) scheduleSaveReconciliation(entry, false);
+      return !entry.reconciliationPending;
+    } catch (error) { if (/CONFLICT/.test(String(error))) buffers.markConflict(entry, error); else entry.recoveryError = String(error); console.error('Could not save document:', error); return false; }
+    finally { entry.saving = false; if (entry === buffers.active()) refreshSaveStatus(entry); }
+  }
+
+  async function reconcileSavedOperation(entry) {
+    const snapshot = entry.reconciliationSnapshot;
+    if (!snapshot || !entry.reconciliationOperationKey) return false;
+    const saved = await invoke('reconcile_save_operation', {
+      projectId: currentProject.projectId,
+      sessionToken: currentProject.sessionToken,
+      operationKey: entry.reconciliationOperationKey,
+    });
+    if (!saved?.fileCommitted) {
+      entry.recoveryError = saved?.reconciliationErrorMessage || 'The committed file could not be reconciled.';
+      return false;
+    }
+    const wasUntitled = entry.documentId === null;
+    const document = saved.document;
+    buffers.applySaveOutcome(entry, snapshot, saved);
+    if (!notifySuccessfulProjectWrite(entry, snapshot)) return false;
+    if (!document) { scheduleSaveReconciliation(entry, false); return false; }
+    entry.documentId = document.documentId; entry.relativePath = document.relativePath; entry.baselineHash = document.baselineHash;
+    if (wasUntitled) { buffers.entries.delete('__untitled__'); buffers.entries.set(entry.relativePath, entry); entry.key = entry.relativePath; if (entry === buffers.active()) buffers.activePath = entry.relativePath; }
+    if (entry === buffers.active()) {
+      currentRelativePath = entry.relativePath; currentPath = `${currentProject.root}/${entry.relativePath}`;
+      currentDocumentId = entry.documentId; currentWriteRevision = entry.writeRevision; dirty = entry.dirty;
+      if (wasUntitled) dailyActivity.adoptIdentity(currentPath);
+    }
+    if (treeNodes.has('')) { treeNodes.get('').loaded = false; await loadDirectory(''); }
+    if (entry.reconciliationPending) scheduleSaveReconciliation(entry, false);
+    return !entry.reconciliationPending;
+  }
+
+  // Reconciliation is bounded and only retries saved documents: Save As must
+  // never reopen a picker or create a second destination in the background.
+  function scheduleSaveReconciliation(entry, allowSaveAs = false) {
+    if (!entry?.reconciliationPending || !entry.reconciliationOperationKey || entry.reconciliationAttempts >= 3 || entry.saving || allowSaveAs) return;
+    entry.reconciliationAttempts += 1;
+    window.setTimeout(() => {
+      if (entry.reconciliationPending && !entry.saving && buffers.contains(entry)) void saveBuffer(entry, false);
+    }, Math.min(8000, 500 * (2 ** entry.reconciliationAttempts)));
   }
 
   async function allowTransition() {
-    const dirtyEntries = [...buffers.entries.values()].filter((entry) => entry.dirty);
+    const dirtyEntries = [...buffers.entries.values()].filter((entry) => entry.dirty || entry.reconciliationPending);
     if (!dirtyEntries.length) return 'clean';
     const action = await askDirty();
     if (action === 'cancel') return 'cancel';
     if (action === 'discard') return 'discard';
-    for (const entry of dirtyEntries) if (!await saveBuffer(entry, entry === buffers.active())) return 'failed';
-    return 'saved';
+    return (await saveAllBuffers(dirtyEntries)).complete ? 'saved' : 'failed';
+  }
+
+  // Save All intentionally evaluates every eligible buffer. Earlier committed
+  // files remain committed when a later conflict/failure blocks a transition.
+  async function saveAllBuffers(entries = [...buffers.entries.values()].filter((entry) => entry.dirty || entry.reconciliationPending)) {
+    const outcomes = {};
+    for (const entry of entries) {
+      const key = entry.relativePath || '__untitled__';
+      try {
+        const complete = await saveBuffer(entry, entry === buffers.active());
+        outcomes[key] = { complete, reconciliationPending: entry.reconciliationPending, conflict: entry.conflict || null, error: entry.recoveryError || null };
+      } catch (error) {
+        entry.recoveryError = String(error);
+        outcomes[key] = { complete: false, reconciliationPending: entry.reconciliationPending, conflict: entry.conflict || null, error: entry.recoveryError };
+      }
+    }
+    return { outcomes, complete: Object.values(outcomes).every((outcome) => outcome.complete) };
   }
 
   async function requestOpenDocument(relativePath) {
@@ -1239,12 +1340,21 @@ async function start() {
       if (!restored?.project) return false;
       setProject(restored.project);
       const documents = restored.documents || (restored.document ? [restored.document] : []);
-      for (const document of documents) replaceDocument(document.content, { relativePath: document.relativePath, documentId: document.documentId, writeRevision: document.writeRevision || 0, baselineHash: document.baselineHash, clean: !document.recovery?.dirty && !document.conflict, restored: { ...(document.recovery || {}), dirty: Boolean(document.recovery?.dirty || document.conflict), conflict: document.conflict } });
+      for (const document of documents) replaceDocument(document.content, { relativePath: document.relativePath, documentId: document.documentId, writeRevision: document.writeRevision || 0, baselineHash: document.baselineHash, clean: !document.recovery?.dirty && !document.conflict, restored: { ...(document.recovery || {}), dirty: Boolean(document.recovery?.dirty || document.conflict), conflict: document.conflict, reconciliationPending: Boolean(document.recovery?.reconciliationOperationKey) } });
       const active = buffers.get(restored.activeRelativePath) || buffers.active();
       if (active) activateBuffer(active); else replaceDocument(DEFAULT_DOCUMENT, { clean: true });
       if (active) selectedTreePath = active.relativePath;
       treeNodes.set('', { entry: { kind: 'directory', name: '' }, loaded: false, expanded: true, children: [] });
       await loadDirectory('');
+      // A restore may deliberately retain a dirty snapshot whose old baseline
+      // differs from disk when Rust verified it is a committed journaled save.
+      // That state is safe to reconcile immediately; treating it as a normal
+      // conflict would strand the opaque key until an unrelated autosave.
+      for (const entry of buffers.entries.values()) {
+        if (entry.reconciliationPending && entry.reconciliationOperationKey) {
+          scheduleSaveReconciliation(entry, false);
+        }
+      }
       return true;
     } catch (error) { console.error('Could not restore project:', error); return false; }
   }
@@ -1254,19 +1364,25 @@ async function start() {
       captureActiveBuffer();
       if (!buffers.project || buffers.persistenceSuppressed) return [];
       return buffers.autosaveEligible().map((entry) => {
-        const snapshot = buffers.writeSnapshot(entry);
+        const pending = entry.reconciliationPending ? entry.reconciliationSnapshot : null;
+        const snapshot = pending && pending.content === entry.state.doc.toString() ? pending : buffers.writeSnapshot(entry);
         return snapshot && { entry, ...snapshot };
       }).filter(Boolean);
     },
     write(saved) {
       if (!buffers.matchesBinding(saved.entry, saved)) throw new Error('Stale autosave session');
-      return invoke('autosave_document', { projectId: saved.projectId, documentId: saved.documentId, revision: saved.revision, content: saved.content });
+      if (saved.entry.reconciliationPending && saved.entry.reconciliationOperationKey) {
+        return invoke('reconcile_save_operation', { projectId: saved.projectId, sessionToken: saved.sessionToken, operationKey: saved.entry.reconciliationOperationKey });
+      }
+      return invoke('autosave_document', { projectId: saved.projectId, sessionToken: saved.sessionToken, documentId: saved.documentId, revision: saved.revision, clientEditVersion: saved.clientEditVersion, content: saved.content });
     },
     onSuccess(saved, result) {
+      if (!result?.fileCommitted) { saved.entry.recoveryError = result?.reconciliationErrorMessage || 'Autosave did not commit the file.'; return; }
+      buffers.applySaveOutcome(saved.entry, saved, result);
       if (!notifySuccessfulProjectWrite(saved.entry, saved)) return;
-      buffers.applyWriteAck(saved.entry, saved, result);
       if (saved.entry === buffers.active()) { dirty = saved.entry.dirty; currentWriteRevision = saved.entry.writeRevision; }
       scheduleRecovery(saved.entry);
+      if (saved.entry.reconciliationPending) scheduleSaveReconciliation(saved.entry, false);
     },
     onError(error, saved) {
       if (saved && buffers.matchesBinding(saved.entry, saved) && /CONFLICT/.test(String(error))) buffers.markConflict(saved.entry, error);
@@ -1414,7 +1530,7 @@ async function start() {
       await runCloseFlow({
         hasDirty: () => [...buffers.entries.values()].some((entry) => entry.dirty),
         decide: askDirty,
-        saveAll: async () => { for (const entry of [...buffers.entries.values()].filter((item) => item.dirty)) if (!await saveBuffer(entry, entry === buffers.active())) return false; return true; },
+        saveAll: async () => (await saveAllBuffers()).complete,
         discardAll: async () => {
           // This terminal barrier prevents an already-resolved write callback
           // or beforeunload from recreating the recovery set after deletion.
@@ -1511,8 +1627,7 @@ async function start() {
         return saveBuffer(untitled, true);
       }
       if (kind === 'save-all') {
-        for (const candidate of [...buffers.entries.values()].filter((item) => item.dirty)) if (!await saveBuffer(candidate, candidate === buffers.active())) return false;
-        return true;
+        return (await saveAllBuffers([...buffers.entries.values()].filter((item) => item.dirty))).complete;
       }
       return saveBuffer(entry, false);
     },
@@ -1522,7 +1637,11 @@ async function start() {
 }
 
 async function runBrowserBenchmark(app, updateSamples, editorHost) {
-  const source = (`# Benchmark\n\n${'alpha beta gamma delta epsilon zeta eta theta iota kappa\n'.repeat(10000)}`).slice(0, 400 * 1024);
+  const benchmarkHeader = '# Benchmark 😀 café — 日本語\n\n';
+  const benchmarkLine = 'alpha beta gamma delta epsilon zeta eta theta iota kappa 😀 café — 日本語\n';
+  // Keep whole Unicode scalars: slicing a UTF-16 string at the target can
+  // split a surrogate pair and turn a recovery/performance fixture invalid.
+  const source = benchmarkHeader + benchmarkLine.repeat(Math.floor((400 * 1024 - benchmarkHeader.length) / benchmarkLine.length));
   const bufferPaths = Array.from({ length: 10 }, (_, index) => `benchmark-${index}.md`);
   for (const path of bufferPaths) app.benchmarkSwitchDocument({ projectId: 99, root: '/benchmark-project' }, path, source);
   const switchSamples = [];

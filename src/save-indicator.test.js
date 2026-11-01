@@ -85,3 +85,35 @@ test('teardown clears the pending save timer and hides the status', () => {
   clock.advance(SAVE_INDICATOR_DURATION_MS);
   assert.equal(element.hidden, true);
 });
+
+test('background recovery status cannot cancel file-saved timer, while conflict supersedes it', () => {
+  const clock = fakeClock(); const element = { hidden: true, dataset: {} };
+  const indicator = createSaveIndicatorController({ element, setTimeoutFn: clock.setTimeout.bind(clock), clearTimeoutFn: clock.clearTimeout.bind(clock) });
+  indicator.update({ fileSaved: true });
+  indicator.update({ recoveryDurable: true });
+  assert.equal(indicator.status, 'fileSaved');
+  clock.advance(SAVE_INDICATOR_DURATION_MS);
+  assert.equal(indicator.status, 'recoveryDurable');
+  indicator.update({ fileSaved: true }); indicator.update({ conflict: true });
+  assert.equal(indicator.status, 'conflict'); assert.equal(clock.pending, 0);
+});
+
+test('committed-file reconciliation is persistent and never rendered as plain success', () => {
+  const clock = fakeClock(); const element = { hidden: true, dataset: {} };
+  const indicator = createSaveIndicatorController({ element, setTimeoutFn: clock.setTimeout.bind(clock), clearTimeoutFn: clock.clearTimeout.bind(clock) });
+  indicator.update({ fileSaved: true, reconciliationPending: true });
+  assert.equal(indicator.status, 'reconciliationPending');
+  clock.advance(SAVE_INDICATOR_DURATION_MS);
+  assert.equal(indicator.status, 'reconciliationPending');
+  indicator.update({ reconciliationError: true });
+  assert.equal(indicator.status, 'reconciliationError');
+});
+
+test('reconciliation status remains exposed through an accessible label', () => {
+  const element = { hidden: true, dataset: {}, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } };
+  const indicator = createSaveIndicatorController({ element });
+  indicator.update({ reconciliationPending: true });
+  assert.match(element.attributes['aria-label'], /recuperação pendente/i);
+  indicator.update({ reconciliationError: true });
+  assert.match(element.attributes['aria-label'], /recuperação com erro/i);
+});

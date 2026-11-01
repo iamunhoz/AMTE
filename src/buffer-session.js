@@ -30,11 +30,6 @@ export function clampRestoredSelection(selection, content) {
   };
 }
 
-function nextRecoverySequence(sequence) {
-  const current = recoverySequenceFrom({ recoverySequence: sequence });
-  if (current >= RECOVERY_SEQUENCE_MAX) throw new RangeError('Recovery sequence cannot be incremented safely');
-  return current + 1;
-}
 export class BufferSession {
   constructor({ project = null, schedule = (...args) => globalThis.setTimeout(...args), cancel = (...args) => globalThis.clearTimeout(...args), recoveryDelay = 750, recoveryMaxDelay = 5000 } = {}) {
     this.project = project;
@@ -93,8 +88,29 @@ export class BufferSession {
       collapsedChapterIdentities: Array.isArray(restored.collapsedChapterIdentities) ? [...new Set(restored.collapsedChapterIdentities)] : [],
       headings: restored.headings || [],
       total: restored.total || 0, analysisVersion: -1, activity: restored.activity || null,
-      recoverySequence: recoverySequenceFrom(restored), recoveryTimer: null,
+      // `recoverySequence` is diagnostic data returned by SQLite. It is never
+      // allocated by this process. `snapshotVersion` fences an immutable local
+      // capture and covers metadata-only snapshots too.
+      recoverySequence: recoverySequenceFrom(restored), snapshotVersion: Number.isSafeInteger(restored.clientEditVersion) ? restored.clientEditVersion : 0,
+      lastDurableEditVersion: Number.isSafeInteger(restored.clientEditVersion) ? restored.clientEditVersion : 0,
+      recoveryState: restored.recoveryError ? 'error' : 'pending', recoveryTimer: null,
       recoveryFirstChange: 0, recoveryWriting: false, recoveryPending: false,
+      // A committed manuscript can still need backend reconciliation. This is
+      // intentionally not folded into `dirty`: an older acknowledgement must
+      // never erase a newer edit, and a clean buffer must still expose a
+      // persistent recovery/selector warning.
+      reconciliationPending: Boolean(restored.reconciliationPending),
+      reconciliationError: restored.reconciliationError || null,
+      reconciliationAttempts: 0,
+      reconciliationOperationKey: restored.reconciliationOperationKey || null,
+      reconciliationSnapshot: restored.reconciliationOperationKey ? {
+        revision: document.writeRevision || 0,
+        clientEditVersion: restored.reconciliationClientEditVersion || restored.clientEditVersion || 0,
+        content: document.content ?? '',
+        // A restored editor has no pre-restart edit counter. The version and
+        // exact content checks in applySaveOutcome fence newer recovered text.
+        editSequence: 0,
+      } : null,
     };
     this.entries.set(key, entry);
     this.manifestDirty = true;
@@ -105,10 +121,10 @@ export class BufferSession {
   contains(entry) { return Boolean(entry) && this.entries.get(entry.key) === entry; }
   bindingFor(entry) {
     if (!this.contains(entry)) return null;
-    return { projectId: this.project?.projectId, projectRoot: this.project?.root, generation: this.generation, entryKey: entry.key };
+    return { projectId: this.project?.projectId, projectRoot: this.project?.root, sessionToken: this.project?.sessionToken, generation: this.generation, entryKey: entry.key };
   }
   matchesBinding(entry, binding) {
-    return !this.persistenceSuppressed && this.contains(entry) && binding?.generation === this.generation && binding?.projectId === this.project?.projectId && binding?.projectRoot === this.project?.root && binding?.entryKey === entry.key;
+    return !this.persistenceSuppressed && this.contains(entry) && binding?.generation === this.generation && binding?.projectId === this.project?.projectId && binding?.projectRoot === this.project?.root && binding?.sessionToken === this.project?.sessionToken && binding?.entryKey === entry.key;
   }
   active() { return this.get(); }
   activate(path) {
@@ -122,6 +138,8 @@ export class BufferSession {
   markEdit(entry) {
     entry.dirty = true;
     entry.editSequence += 1;
+    entry.snapshotVersion += 1;
+    entry.recoveryState = 'pending';
     this.manifestDirty = true;
   }
   allocateRevision(entry) {
@@ -131,7 +149,7 @@ export class BufferSession {
   writeSnapshot(entry) {
     const binding = this.bindingFor(entry);
     if (!binding) return null;
-    return { ...binding, documentId: entry.documentId, revision: this.allocateRevision(entry), editSequence: entry.editSequence, content: entry.state.doc.toString() };
+    return { ...binding, documentId: entry.documentId, revision: this.allocateRevision(entry), editSequence: entry.editSequence, clientEditVersion: entry.snapshotVersion, content: entry.state.doc.toString() };
   }
   applyWriteAck(entry, snapshot, saved) {
     if (!entry || snapshot.revision < entry.writeRevision) return false;
@@ -139,15 +157,51 @@ export class BufferSession {
     entry.nextRevision = Math.max(entry.nextRevision, entry.writeRevision);
     entry.baselineHash = saved?.baselineHash ?? entry.baselineHash;
     entry.lastSavedText = snapshot.content;
-    if (entry.editSequence === snapshot.editSequence) entry.dirty = false;
+    if (entry.editSequence === snapshot.editSequence) {
+      entry.dirty = false;
+      if (entry.recoveryTimer !== null) { this.cancel(entry.recoveryTimer); entry.recoveryTimer = null; }
+      entry.recoveryPending = false;
+      entry.lastDurableEditVersion = Math.max(entry.lastDurableEditVersion, snapshot.clientEditVersion);
+      entry.recoveryState = 'durable';
+    }
     return !entry.dirty;
   }
+  applySaveOutcome(entry, snapshot, outcome) {
+    if (!outcome?.fileCommitted) return false;
+    const saved = outcome.document || outcome;
+    const canClearDirty = snapshot.content === entry.state.doc.toString()
+      && snapshot.clientEditVersion === entry.snapshotVersion;
+    this.applyWriteAck(entry, { ...snapshot, editSequence: canClearDirty ? entry.editSequence : -1 }, saved);
+    entry.baselineHash = outcome.baselineHash || saved.baselineHash || entry.baselineHash;
+    entry.writeRevision = outcome.writeRevision ?? saved.writeRevision ?? entry.writeRevision;
+    entry.nextRevision = Math.max(entry.nextRevision, entry.writeRevision);
+    entry.reconciliationPending = Boolean(outcome.reconciliationPending);
+    entry.reconciliationError = outcome.reconciliationErrorMessage || outcome.reconciliationErrorCode || null;
+    entry.reconciliationOperationKey = outcome.operationKey || entry.reconciliationOperationKey;
+    if (entry.reconciliationPending) {
+      entry.recoveryState = entry.reconciliationError ? 'error' : 'pending';
+      // The existing dirty recovery history remains durable in SQLite; do not
+      // erase it merely because the manuscript rename succeeded.
+      entry.recoveryPending = true;
+      entry.reconciliationSnapshot = { ...snapshot };
+    } else {
+      entry.reconciliationError = null;
+      entry.reconciliationAttempts = 0;
+      entry.reconciliationSnapshot = null;
+      entry.reconciliationOperationKey = null;
+    }
+    this.manifestDirty = true;
+    return !entry.dirty && !entry.reconciliationPending;
+  }
   markConflict(entry, reason) { entry.conflict = String(reason || 'File changed on disk'); entry.dirty = true; }
-  autosaveEligible() { return [...this.entries.values()].filter((entry) => entry.dirty && entry.documentId !== null && !entry.conflict); }
+  autosaveEligible() { return [...this.entries.values()].filter((entry) => (entry.dirty || entry.reconciliationPending) && entry.documentId !== null && !entry.conflict); }
 
   scheduleRecovery(entry, persist) {
     if (!this.contains(entry) || this.persistenceSuppressed) return;
+    if (!entry.dirty) { entry.recoveryState = 'durable'; return; }
     entry.recoveryPending = true;
+    entry.snapshotVersion += 1;
+    entry.recoveryState = 'pending';
     const now = Date.now();
     if (!entry.recoveryFirstChange) entry.recoveryFirstChange = now;
     if (entry.recoveryTimer !== null) this.cancel(entry.recoveryTimer);
@@ -165,19 +219,31 @@ export class BufferSession {
     if (entry.recoveryWriting) { entry.recoveryPending = true; return; }
     entry.recoveryWriting = true;
     entry.recoveryPending = false;
-    const sequence = nextRecoverySequence(entry.recoverySequence);
+    entry.recoveryState = 'persisting';
+    const snapshot = {
+      ...binding, documentId: entry.documentId, writeRevision: entry.writeRevision,
+      editSequence: entry.editSequence, clientEditVersion: entry.snapshotVersion,
+      dirty: entry.dirty, content: entry.state.doc.toString(), baselineHash: entry.baselineHash,
+      sourceScroll: entry.sourceScroll, selection: entry.selection, previewScroll: entry.previewScroll,
+      previewing: entry.previewing, searchTerm: entry.searchTerm, chapterIdentity: entry.chapterIdentity,
+      chapterScroll: entry.chapterScroll, collapsedChapterIdentities: [...entry.collapsedChapterIdentities], activity: entry.activity,
+    };
     try {
-      const result = await persist(entry, sequence, binding);
+      const result = await persist(entry, snapshot, binding);
       if (!this.matchesBinding(entry, binding)) return;
-      entry.recoverySequence = sequence;
+      if (result?.clientEditVersion !== snapshot.clientEditVersion || result?.durable !== true) throw new Error('Recovery acknowledgement was stale or not durable');
+      entry.recoverySequence = result.recoverySequence;
+      entry.lastDurableEditVersion = snapshot.clientEditVersion;
+      entry.recoveryState = 'durable';
       entry.recoveryFirstChange = 0;
-      entry.recoveryError = result?.cleanupError ? String(result.cleanupError) : null;
+      entry.recoveryError = null;
     } catch (error) {
       entry.recoveryError = String(error);
+      entry.recoveryState = 'error';
       throw error;
     } finally {
       entry.recoveryWriting = false;
-      if (entry.recoveryPending) this.scheduleRecovery(entry, persist);
+      if (entry.recoveryPending || entry.snapshotVersion > snapshot.clientEditVersion) this.scheduleRecovery(entry, persist);
     }
   }
   async flushRecovery(persist) {
@@ -186,6 +252,7 @@ export class BufferSession {
       if (entry.recoveryTimer !== null) { this.cancel(entry.recoveryTimer); entry.recoveryTimer = null; }
       // Clean entries keep only UI metadata (not manuscript text), which lets a
       // normal close restore positions without rewriting a large document.
+      if (!entry.dirty || (entry.snapshotVersion <= entry.lastDurableEditVersion && !entry.recoveryPending)) return;
       await this.persistRecovery(entry, persist);
     }));
   }
@@ -194,10 +261,13 @@ export class BufferSession {
       activePath: this.activePath,
       entries: [...this.entries.values()].map((entry) => ({
         relativePath: entry.relativePath, documentId: entry.documentId, dirty: entry.dirty,
-        recoverySequence: entry.recoverySequence, sourceScroll: entry.sourceScroll, selection: entry.selection,
+      recoverySequence: entry.recoverySequence, sourceScroll: entry.sourceScroll, selection: entry.selection,
          previewScroll: entry.previewScroll, previewing: entry.previewing, searchTerm: entry.searchTerm,
          chapterIdentity: entry.chapterIdentity, chapterScroll: entry.chapterScroll,
          collapsedChapterIdentities: entry.collapsedChapterIdentities,
+        reconciliationPending: entry.reconciliationPending,
+        reconciliationOperationKey: entry.reconciliationOperationKey,
+        reconciliationClientEditVersion: entry.reconciliationSnapshot?.clientEditVersion || null,
       })),
     };
   }

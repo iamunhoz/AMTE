@@ -1,0 +1,21 @@
+{
+  "projectId": 42,
+  "buffer": {
+    "relativePath": "chapter.md",
+    "documentId": 7,
+    "writeRevision": 9,
+    "clientEditVersion": 14,
+    "dirty": true,
+    "content": "Draft from the real frontend invoke shape",
+    "baselineHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceScroll": { "top": 12, "left": 0 },
+    "selection": { "anchor": 3, "head": 3 },
+    "previewScroll": 4,
+    "previewing": false,
+    "searchTerm": "term",
+    "chapterIdentity": "chapter",
+    "chapterScroll": 5,
+    "collapsedChapterIdentities": ["chapter"],
+    "activity": { "day": "2026-10-25", "added": 2, "deleted": 1 }
+  }
+}

@@ -4,6 +4,10 @@ import { rm } from 'node:fs/promises';
 
 const root = process.cwd();
 const searchCheck = process.argv.includes('--search-check');
+const INPUT_P95_LIMIT_MS = 8;
+// A buffer handoff replaces the live CodeMirror state and is allowed two
+// 60 Hz frames; above that it is no longer responsive.
+const SWITCH_P95_LIMIT_MS = 32;
 const cdpPort = 9300 + (process.pid % 500);
 const profile = `/tmp/opencode/amte-benchmark-${process.pid}`;
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -36,9 +40,9 @@ function assertBrowser(condition, message) {
 }
 
 try {
-  const viteArgs = searchCheck
-    ? ['node_modules/vite/bin/vite.js', 'preview', '--host', '127.0.0.1', '--port', '0']
-    : ['node_modules/vite/bin/vite.js', '--config', 'vite.config.js', '--host', '127.0.0.1', '--port', '0'];
+  // Measure the production bundle in both modes. This local server exists only
+  // for Chromium CDP; the packaged Tauri release embeds these same assets.
+  const viteArgs = ['node_modules/vite/bin/vite.js', 'preview', '--host', '127.0.0.1', '--port', '0'];
   server = spawn(process.execPath, viteArgs, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
   let viteOutput = '';
   server.stdout.on('data', (chunk) => { viteOutput += chunk; });
@@ -112,8 +116,8 @@ try {
     await cdp('Page.addScriptToEvaluateOnNewDocument', {
       source: `globalThis.__TAURI__ = { core: { invoke: async (command, args = {}) => {
         if (command === 'restore_last_project') return null;
-        if (command === 'save_document' || command === 'autosave_document') return { relativePath: 'check.md', documentId: args.documentId, writeRevision: args.revision, baselineHash: 'accepted' };
-        if (command === 'save_document_as') return { relativePath: 'saved-as.md', documentId: 2, writeRevision: args.revision, baselineHash: 'accepted' };
+        if (command === 'save_document' || command === 'autosave_document') return { fileCommitted: true, recoveryCheckpointDurable: true, selectorSessionStateDurable: true, reconciliationPending: false, writeRevision: args.revision, baselineHash: 'accepted', document: { relativePath: 'check.md', documentId: args.documentId, writeRevision: args.revision, baselineHash: 'accepted' } };
+        if (command === 'save_document_as') return { fileCommitted: true, recoveryCheckpointDurable: true, selectorSessionStateDurable: true, reconciliationPending: false, writeRevision: args.revision, baselineHash: 'accepted', document: { relativePath: 'saved-as.md', documentId: 2, writeRevision: args.revision, baselineHash: 'accepted' } };
         return {};
       } } };`,
     });
@@ -158,7 +162,8 @@ try {
     })`);
     assertBrowser(visibleAt4999, 'Save indicator hid before 5000ms');
     await new Promise((resolve) => setTimeout(resolve, 25));
-    assertBrowser((await saveIndicatorStyle()).hidden, 'Save indicator remained visible after 5000ms');
+    const expiredSaveIndicator = await saveIndicatorStyle();
+    assertBrowser(expiredSaveIndicator.hidden, `Save indicator remained visible after 5000ms (${JSON.stringify(expiredSaveIndicator)})`);
     await evaluate(`window.__amteReady.then((app) => app.browserCheckSave('autosave'))`);
     await assertVisibleSaveIndicator('Monokai autosave retrigger');
     await evaluate(`window.__amteReady.then((app) => app.browserCheckSave('save-all'))`);
@@ -226,6 +231,10 @@ try {
     await cdp('Input.insertText', { text: 'alpha' });
     await press('Enter', { code: 'Enter', virtualKeyCode: 13 });
     await waitFor(async () => !(await evaluate('document.querySelector("#search-dialog")?.open')), 'search dialog closing after no-match recovery');
+    // A dialog's `close` event can be queued after its `open` state flips.
+    // Let its production focus-restoration handler finish before exercising an
+    // unrelated preview transition, exactly as separate user input tasks do.
+    await evaluate('new Promise((resolve) => setTimeout(resolve, 0))');
 
     // CDP's Control modifier delivery is flaky under some headless Chromium
     // builds; keyboard routing is source-tested, while this exercises preview
@@ -385,6 +394,9 @@ try {
     const result = JSON.parse(encoded);
     if (!result.converged || result.workerVersion !== result.sourceVersion) {
       throw new Error(`Worker did not converge (${result.workerVersion}/${result.sourceVersion})`);
+    }
+    if (result.p95Ms > INPUT_P95_LIMIT_MS || result.bufferSwitchP95Ms > SWITCH_P95_LIMIT_MS) {
+      throw new Error(`Performance regression: input p95 ${result.p95Ms}ms (limit ${INPUT_P95_LIMIT_MS}ms), buffer-switch p95 ${result.bufferSwitchP95Ms}ms (limit ${SWITCH_P95_LIMIT_MS}ms)`);
     }
     console.log(result);
   }
