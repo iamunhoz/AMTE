@@ -8699,6 +8699,82 @@ mod tests {
     }
 
     #[test]
+    fn picker_response_fixture_is_the_camel_case_tauri_wire_contract() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../src/project-picker-response.fixture.json"
+        ))
+        .unwrap();
+        let candidate = ProjectCandidateDto {
+            candidate_id: 1,
+            root: "/tmp/opencode/amte-picker-fixture".into(),
+        };
+        let serialized = serde_json::to_value(candidate).unwrap();
+        assert_eq!(serialized, fixture);
+        assert!(serialized.get("candidate_id").is_none());
+        assert_eq!(serialized["candidateId"], 1);
+    }
+
+    #[test]
+    fn published_picker_candidate_serializes_and_exposes_a_disposable_markdown_root() {
+        let base = temp("picker-wire-integration");
+        let root = base.join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("root-entry.md"), "# Disposable picker entry\n").unwrap();
+        let authority = ProjectAuthority::default();
+        let activation = ActivationAuthority::default();
+        let candidate = publish_picked_project(
+            &authority,
+            &activation,
+            canonical_project_root(&root).unwrap(),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(wire["candidateId"], candidate.candidate_id);
+        assert_eq!(
+            wire["root"],
+            root.canonicalize().unwrap().display().to_string()
+        );
+        let root_fd = open_directory_path(Path::new(wire["root"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            list_entries(&root_fd, Path::new(""))
+                .unwrap()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root-entry.md"]
+        );
+        assert_eq!(
+            authority
+                .0
+                .lock()
+                .unwrap()
+                .pending_project
+                .as_ref()
+                .map(|(id, _)| *id),
+            Some(candidate.candidate_id)
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn activation_response_fixture_is_the_camel_case_tauri_wire_contract() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../src/project-activation-response.fixture.json"
+        ))
+        .unwrap();
+        let serialized = serde_json::to_value(ProjectDto {
+            project_id: 2,
+            root: "/tmp/opencode/amte-picker-fixture".into(),
+            session_token: "a".repeat(64),
+        })
+        .unwrap();
+        assert_eq!(serialized, fixture);
+        assert!(serialized.get("project_id").is_none());
+        assert_eq!(serialized["projectId"], 2);
+        assert_eq!(serialized["sessionToken"], "a".repeat(64));
+    }
+
+    #[test]
     fn restart_rebinds_pending_save_as_without_picker_and_rejects_changed_disk() {
         let base = temp("restart-save-as-rebind");
         let root = base.join("project");

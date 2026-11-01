@@ -1,9 +1,14 @@
 /* Runs the in-app 400 KiB benchmark through Chromium CDP with real worker time. */
 import { spawn } from 'node:child_process';
-import { rm } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 
 const root = process.cwd();
 const searchCheck = process.argv.includes('--search-check');
+const projectOpenCheck = process.argv.includes('--project-open-check');
+const pickerFixturePath = new URL('./project-picker-response.fixture.json', import.meta.url);
+const activationFixturePath = new URL('./project-activation-response.fixture.json', import.meta.url);
+const pickerFixture = JSON.parse(await readFile(pickerFixturePath, 'utf8'));
+const activationFixture = JSON.parse(await readFile(activationFixturePath, 'utf8'));
 const INPUT_P95_LIMIT_MS = 8;
 // A buffer handoff replaces the live CodeMirror state and is allowed two
 // 60 Hz frames; above that it is no longer responsive.
@@ -33,6 +38,7 @@ async function cleanup() {
   server?.kill();
   await sleep(250);
   await rm(profile, { recursive: true, force: true });
+  await rm(pickerFixture.root, { recursive: true, force: true });
 }
 
 function assertBrowser(condition, message) {
@@ -112,18 +118,73 @@ try {
       throw error;
     }
   };
-  if (searchCheck) {
+  if (searchCheck || projectOpenCheck) {
+    await mkdir(pickerFixture.root, { recursive: true });
+    await writeFile(`${pickerFixture.root}/root-entry.md`, '# Disposable picker entry\n');
     await cdp('Page.addScriptToEvaluateOnNewDocument', {
       source: `globalThis.__TAURI__ = { core: { invoke: async (command, args = {}) => {
+        const picker = globalThis.__AMTE_PICKER_TEST__;
         if (command === 'restore_last_project') return null;
+        if (command === 'pick_project') { picker.pickCalls += 1; return picker.mode === 'cancel' ? null : picker.candidate; }
+        if (command === 'activate_picked_project') {
+          picker.activationCalls += 1; picker.activationArgs.push(args);
+          if (picker.mode === 'fail') throw new Error('injected activation failure');
+          return picker.project;
+        }
+        if (command === 'list_project_directory') return picker.entries;
         if (command === 'save_document' || command === 'autosave_document') return { fileCommitted: true, recoveryCheckpointDurable: true, selectorSessionStateDurable: true, reconciliationPending: false, writeRevision: args.revision, baselineHash: 'accepted', document: { relativePath: 'check.md', documentId: args.documentId, writeRevision: args.revision, baselineHash: 'accepted' } };
         if (command === 'save_document_as') return { fileCommitted: true, recoveryCheckpointDurable: true, selectorSessionStateDurable: true, reconciliationPending: false, writeRevision: args.revision, baselineHash: 'accepted', document: { relativePath: 'saved-as.md', documentId: 2, writeRevision: args.revision, baselineHash: 'accepted' } };
         return {};
-      } } };`,
+      } } }; globalThis.__AMTE_PICKER_TEST__ = { mode: 'open', pickCalls: 0, activationCalls: 0, activationArgs: [], candidate: ${JSON.stringify(pickerFixture)}, project: ${JSON.stringify(activationFixture)}, entries: [{ name: 'root-entry.md', relativePath: 'root-entry.md', kind: 'file' }] };`,
     });
     await cdp('Page.navigate', { url: `${viteUrl}?browser-check=1` });
     const started = await waitFor(() => evaluate('window.__amteReady?.then(() => true, (error) => `startup error: ${error?.stack || error}`)'), 'application startup');
     if (typeof started === 'string') throw new Error(started);
+    if (projectOpenCheck) {
+      const opened = await evaluate(`window.__amteReady.then(async (app) => {
+        await app.openProject();
+        return {
+          path: document.querySelector('#project-path').textContent,
+          entries: [...document.querySelectorAll('#project-tree [role=treeitem]')].map((row) => row.textContent),
+          errorHidden: document.querySelector('#project-error').hidden,
+          calls: globalThis.__AMTE_PICKER_TEST__,
+        };
+      })`);
+      assertBrowser(opened.path === activationFixture.root, `Picker activation did not install the realpath (${JSON.stringify(opened)})`);
+      assertBrowser(opened.entries.some((entry) => entry.includes('root-entry.md')), `Picker activation did not install the disposable Markdown root entry (${JSON.stringify(opened)})`);
+      assertBrowser(opened.errorHidden && opened.calls.pickCalls === 1 && opened.calls.activationCalls === 1 && opened.calls.activationArgs[0]?.candidateId === pickerFixture.candidateId, `Picker response was not consumed exactly once (${JSON.stringify(opened)})`);
+
+      const existing = await evaluate(`window.__amteReady.then(async (app) => {
+        const test = globalThis.__AMTE_PICKER_TEST__; test.mode = 'open'; const before = test.activationCalls;
+        await app.openProject();
+        return { path: document.querySelector('#project-path').textContent, activations: test.activationCalls - before };
+      })`);
+      assertBrowser(existing.path === activationFixture.root && existing.activations === 1, `Existing project was not replaced by one selected project (${JSON.stringify(existing)})`);
+
+      const cancelled = await evaluate(`window.__amteReady.then(async (app) => {
+        const test = globalThis.__AMTE_PICKER_TEST__; test.mode = 'cancel';
+        await app.openProject();
+        return { path: document.querySelector('#project-path').textContent, calls: test };
+      })`);
+      assertBrowser(cancelled.path === activationFixture.root && cancelled.calls.activationCalls === 2, `Cancelled picker changed the active project (${JSON.stringify(cancelled)})`);
+
+      const failed = await evaluate(`window.__amteReady.then(async (app) => {
+        const test = globalThis.__AMTE_PICKER_TEST__; test.mode = 'fail';
+        await app.openProject();
+        const error = document.querySelector('#project-error');
+        return { path: document.querySelector('#project-path').textContent, hidden: error.hidden, role: error.getAttribute('role'), text: error.textContent, calls: test };
+      })`);
+      assertBrowser(failed.path === activationFixture.root && !failed.hidden && failed.role === 'alert' && /injected activation failure/.test(failed.text), `Activation failure was not persistent and accessible while retaining the old project (${JSON.stringify(failed)})`);
+
+      const serialized = await evaluate(`window.__amteReady.then(async (app) => {
+        const test = globalThis.__AMTE_PICKER_TEST__; test.mode = 'open'; const before = test.activationCalls;
+        await Promise.all([app.openProject(), app.openProject()]);
+        const error = document.querySelector('#project-error');
+        return { activations: test.activationCalls - before, errorHidden: error.hidden, path: document.querySelector('#project-path').textContent };
+      })`);
+      assertBrowser(serialized.activations === 1 && serialized.errorHidden && serialized.path === activationFixture.root, `Duplicate Ctrl+O activation was not serialized (${JSON.stringify(serialized)})`);
+      console.log({ projectOpenCheck: 'passed', root: activationFixture.root, markdown: 'root-entry.md' });
+    }
     const exerciseActivity = async (path) => {
       await evaluate(`window.__amteReady.then((app) => { app.benchmarkSwitchDocument({ projectId: 1, root: '/mock-project' }, '${path}', ''); app.view.focus(); return true; })`);
       await cdp('Input.insertText', { text: 'hello' });

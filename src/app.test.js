@@ -16,6 +16,8 @@ const styles = read('src/styles.css');
 const config = JSON.parse(read('src/config.json'));
 const theme = JSON.parse(read('src/theme.json'));
 const vintage = JSON.parse(read('src/themes/vintage-msdos-edit.json'));
+const pickerResponse = JSON.parse(read('src/project-picker-response.fixture.json'));
+const activationResponse = JSON.parse(read('src/project-activation-response.fixture.json'));
 const controllerSource = source.match(/\/\* AUTOSAVE_CONTROLLER_START \*\/([\s\S]*?)\/\* AUTOSAVE_CONTROLLER_END \*\//)?.[1];
 assert.ok(controllerSource);
 const createAutosaveController = new Function(`const AUTOSAVE_INTERVAL_MS = 300000;${controllerSource}; return createAutosaveController;`)();
@@ -149,6 +151,12 @@ test('project transitions use Save, Discard, Cancel and scoped commands', () => 
   assert.match(source, /invoke\('save_document_as', \{ projectId: currentProject\.projectId, sessionToken: currentProject\.sessionToken, revision: snapshot\.revision, clientEditVersion: snapshot\.clientEditVersion, content: snapshot\.content, sourceRecovery:/s);
   assert.match(source, /buffers\.get\(relativePath\)/);
   assert.match(source, /activateBuffer\(cached\)/);
+  assert.deepEqual(pickerResponse, { candidateId: 1, root: '/tmp/opencode/amte-picker-fixture' });
+  assert.equal(activationResponse.projectId, 2);
+  assert.equal(activationResponse.sessionToken.length, 64);
+  assert.match(source, /candidateIdFromPickerResponse\(candidate\)/);
+  assert.match(source, /projectFromActivationResponse\(await invoke\('activate_picked_project'/);
+  assert.match(html, /id="project-error"[^>]*role="alert"[^>]*aria-live="assertive"/);
 });
 
 test('plain F1/F2/F3 focus routing prevents defaults and preserves existing Ctrl commands', () => {
@@ -253,7 +261,8 @@ test('failed project activation retains the live frontend session until backend 
   const activation = source.indexOf("await invoke('activate_picked_project'");
   const replacement = source.indexOf('setProject(project); replaceDocument', activation);
   assert.ok(activation >= 0 && replacement > activation);
-  assert.match(source, /catch \(error\) \{ console\.error\('Could not open project:', error\); \}/);
+  assert.match(source, /showProjectError\(error\);\s*console\.error\('Could not open project:', error\);/);
+  assert.match(source, /projectError\.hidden = false/);
   assert.match(source, /if \(decision === 'cancel' \|\| decision === 'failed'\) return;/);
 });
 

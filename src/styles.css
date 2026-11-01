@@ -67,6 +67,7 @@ body {
   overflow: hidden;
 }
 .project-path { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-error { margin: 0.2rem 0 0; color: var(--theme-danger, #b42318); font-weight: 700; overflow-wrap: anywhere; }
 
 .writing-layout {
   width: 100%;

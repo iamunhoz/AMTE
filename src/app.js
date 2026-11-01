@@ -330,6 +330,7 @@ async function start() {
   const searchClose = document.querySelector('#search-close');
   const searchStatus = document.querySelector('#search-status');
   const projectPathLabel = document.querySelector('#project-path');
+  const projectError = document.querySelector('#project-error');
   const documentShell = document.querySelector('#document-shell');
   const themeChrome = document.querySelector('#theme-chrome');
   const saveIndicator = createSaveIndicatorController({ element: document.querySelector('#save-indicator') });
@@ -1073,6 +1074,34 @@ async function start() {
     updateThemeChrome();
   }
 
+  function clearProjectError() {
+    projectError.hidden = true;
+    projectError.textContent = '';
+  }
+
+  function showProjectError(error) {
+    const message = String(error?.message || error || 'Unknown error').replace(/\s+/g, ' ').trim();
+    projectError.textContent = `Could not open project: ${message || 'Unknown error'}`;
+    projectError.hidden = false;
+  }
+
+  function candidateIdFromPickerResponse(candidate) {
+    if (!candidate || !Number.isSafeInteger(candidate.candidateId) || candidate.candidateId < 1
+      || typeof candidate.root !== 'string' || !candidate.root) {
+      throw new Error('The selected project response was invalid. Please choose the folder again.');
+    }
+    return candidate.candidateId;
+  }
+
+  function projectFromActivationResponse(project) {
+    if (!project || !Number.isSafeInteger(project.projectId) || project.projectId < 1
+      || typeof project.root !== 'string' || !project.root
+      || typeof project.sessionToken !== 'string' || !project.sessionToken) {
+      throw new Error('Project activation returned an invalid session. The previous project remains open.');
+    }
+    return project;
+  }
+
   function replaceDocument(document, { relativePath = null, documentId = null, writeRevision = 0, baselineHash = null, clean = false, restored = {} } = {}) {
     clearSearchState({ closeDialog: true });
     const safeRestored = { ...restored, selection: clampRestoredSelection(restored.selection, document) };
@@ -1316,6 +1345,7 @@ async function start() {
       // retain the old registry, buffers, and recovery data.
       const candidate = await invoke('pick_project');
       if (!candidate) return;
+      const candidateId = candidateIdFromPickerResponse(candidate);
       const decision = await allowTransition();
       if (decision === 'cancel' || decision === 'failed') return;
       // Freeze the old session before activation.  This waits out old writes,
@@ -1325,13 +1355,20 @@ async function start() {
       autosaveQuiesced = true;
       await buffers.drainRecovery();
       await flushRecovery();
-      const project = await invoke('activate_picked_project', { candidateId: candidate.candidateId, discardPreviousRecovery: decision === 'discard' });
+      const project = projectFromActivationResponse(await invoke('activate_picked_project', { candidateId, discardPreviousRecovery: decision === 'discard' }));
       setProject(project); replaceDocument(DEFAULT_DOCUMENT, { clean: true });
       autosave.resume();
       autosaveQuiesced = false;
       treeNodes.set('', { entry: { kind: 'directory', name: '' }, loaded: false, expanded: true, children: [] });
       await loadDirectory('');
-    } catch (error) { console.error('Could not open project:', error); } finally { if (autosaveQuiesced) autosave.resume(); transitionInFlight = false; }
+      clearProjectError();
+    } catch (error) {
+      // A backend activation failure occurs before setProject, so the existing
+      // frontend binding remains live. Surface it instead of leaving Ctrl+O
+      // looking like a no-op while retaining the backend's old session/CAS.
+      showProjectError(error);
+      console.error('Could not open project:', error);
+    } finally { if (autosaveQuiesced) autosave.resume(); transitionInFlight = false; }
   }
 
   async function restoreLastProject() {
@@ -1604,6 +1641,7 @@ async function start() {
     get sourceVersion() { return sourceVersion; },
     get analysisVersion() { return analysisVersion; },
     togglePreview,
+    openProject,
     replaceDocument,
     // CDP coverage uses this in benchmark mode to exercise file-scoped
     // storage without granting the browser test any filesystem capability.
