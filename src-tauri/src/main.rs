@@ -7759,34 +7759,27 @@ mod tests {
         let mismatch_dir = mismatch_base.join("config/recovery-v2");
         fs::create_dir_all(&mismatch_dir).unwrap();
         fs::copy(&original, mismatch_dir.join("recovery.sqlite3")).unwrap();
-        fs::write(
-            mismatch_dir.join("recovery.sqlite3-wal"),
-            b"mismatched wal bytes",
-        )
-        .unwrap();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                mismatch_dir.join("recovery.sqlite3-wal"),
-                fs::Permissions::from_mode(0o600),
-            )
-            .unwrap();
+            // SQLite may legitimately leave a stale WAL after a checkpoint;
+            // this is not parsed during permission migration. A link is never
+            // a legitimate sidecar and must fail before any chmod follows it.
+            let outside = mismatch_base.join("outside-wal");
+            fs::write(&outside, b"outside WAL fixture").unwrap();
+            std::os::unix::fs::symlink(&outside, mismatch_dir.join("recovery.sqlite3-wal"))
+                .unwrap();
         }
         assert!(
             RecoveryDb::for_config(&mismatch_base.join("config")).is_err(),
-            "mismatched WAL must fail closed"
+            "linked WAL must fail closed"
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let private = base.join("config/recovery-v2");
             fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(
-                RecoveryDb::for_config(&base.join("config"))
-                    .unwrap_err()
-                    .contains("owner-private")
-            );
+            RecoveryDb::for_config(&base.join("config")).unwrap();
+            assert_eq!(private_mode(&private), 0o700);
         }
         fs::remove_dir_all(corrupt_base).unwrap();
         fs::remove_dir_all(mismatch_base).unwrap();
@@ -8772,6 +8765,165 @@ mod tests {
         assert!(serialized.get("project_id").is_none());
         assert_eq!(serialized["projectId"], 2);
         assert_eq!(serialized["sessionToken"], "a".repeat(64));
+    }
+
+    #[cfg(unix)]
+    fn private_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_v2_public_config_is_hardened_before_project_activation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = temp("pre-v2-permission-activation");
+        let config = base.join("config");
+        let recovery = config.join("recovery-v2");
+        let project = base.join("project");
+        fs::create_dir(&config).unwrap();
+        fs::create_dir(&recovery).unwrap();
+        fs::create_dir(&project).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o755)).unwrap();
+        // A pre-V2 selector may remain in the app-owned root; hardening the
+        // directory must not read or rewrite this unrelated legacy file.
+        fs::write(config.join("last-project-v1"), "legacy-selector").unwrap();
+
+        let canonical = canonical_project_root(&project)
+            .unwrap()
+            .display()
+            .to_string();
+        let db = RecoveryDb::for_config(&config).unwrap();
+        db.transition_active_session(None, &canonical, &"a".repeat(64))
+            .unwrap();
+        let database = recovery.join("recovery.sqlite3");
+        assert_eq!(private_mode(&config), 0o700);
+        assert_eq!(private_mode(&recovery), 0o700);
+        assert_eq!(private_mode(&database), 0o600);
+        // Already-private storage is accepted without changing its identity.
+        let before = fs::metadata(&database).unwrap();
+        RecoveryDb::for_config(&config).unwrap();
+        let after = fs::metadata(&database).unwrap();
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(private_mode(&database), 0o600);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sqlite_components_upgrade_to_private_modes_without_parsing_their_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp("sqlite-component-permissions");
+        let config = base.join("config");
+        recovery_db::RecoveryDb::harden_storage_components_for_test(&config).unwrap();
+        let recovery = config.join("recovery-v2");
+        let database = recovery.join("recovery.sqlite3");
+        for name in [
+            "recovery.sqlite3",
+            "recovery.sqlite3-wal",
+            "recovery.sqlite3-shm",
+            "recovery.sqlite3-journal",
+        ] {
+            let path = recovery.join(name);
+            if name != "recovery.sqlite3" {
+                fs::write(&path, b"sidecar metadata fixture").unwrap();
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o755)).unwrap();
+        recovery_db::RecoveryDb::harden_storage_components_for_test(&config).unwrap();
+        assert_eq!(private_mode(&config), 0o700);
+        assert_eq!(private_mode(&recovery), 0o700);
+        for name in [
+            "recovery.sqlite3",
+            "recovery.sqlite3-wal",
+            "recovery.sqlite3-shm",
+            "recovery.sqlite3-journal",
+        ] {
+            assert_eq!(private_mode(&recovery.join(name)), 0o600, "{name}");
+        }
+        assert_eq!(private_mode(&database), 0o600);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_permission_hardening_rejects_links_nonregular_and_escaped_paths() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let base = temp("recovery-permission-hostile");
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        let escaped = base.join("escaped-config");
+        symlink(&outside, &escaped).unwrap();
+        assert!(
+            RecoveryDb::for_config(&escaped)
+                .unwrap_err()
+                .contains("without following links")
+        );
+        assert_eq!(
+            private_mode(&outside),
+            0o755,
+            "outside must not be hardened through a config symlink"
+        );
+
+        let config = base.join("config");
+        fs::create_dir(&config).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&outside, config.join("recovery-v2")).unwrap();
+        assert!(RecoveryDb::for_config(&config).is_err());
+        fs::remove_file(config.join("recovery-v2")).unwrap();
+        let recovery = config.join("recovery-v2");
+        fs::create_dir(&recovery).unwrap();
+        fs::set_permissions(&recovery, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let linked_target = outside.join("linked.sqlite3");
+        fs::write(&linked_target, b"outside sqlite fixture").unwrap();
+        fs::set_permissions(&linked_target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&linked_target, recovery.join("recovery.sqlite3")).unwrap();
+        assert!(
+            RecoveryDb::for_config(&config)
+                .unwrap_err()
+                .contains("unexpected links")
+        );
+        assert_eq!(private_mode(&linked_target), 0o600);
+        fs::remove_file(recovery.join("recovery.sqlite3")).unwrap();
+
+        fs::create_dir(recovery.join("recovery.sqlite3")).unwrap();
+        assert!(RecoveryDb::for_config(&config).is_err());
+        fs::remove_dir(recovery.join("recovery.sqlite3")).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_permission_hardening_rejects_wrong_owner_when_testable() {
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let base = temp("recovery-permission-wrong-owner");
+        let config = base.join("config");
+        fs::create_dir(&config).unwrap();
+        let result = unsafe {
+            libc::chown(
+                CString::new(config.as_os_str().as_bytes())
+                    .unwrap()
+                    .as_ptr(),
+                65_534,
+                65_534,
+            )
+        };
+        assert_eq!(result, 0);
+        assert!(
+            RecoveryDb::for_config(&config)
+                .unwrap_err()
+                .contains("not owned by the effective user")
+        );
+        assert_eq!(fs::symlink_metadata(&config).unwrap().uid(), 65_534);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

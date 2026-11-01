@@ -1,9 +1,16 @@
 //! Recovery V2's only runtime writer.  The v1 JSON store remains read-only
 //! migration input in `main.rs`; this module never removes or edits it.
 use std::{
-    fs,
+    ffi::{CString, OsStr},
+    fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::ffi::OsStrExt,
 };
 
 #[cfg(test)]
@@ -258,6 +265,7 @@ fn take_legacy_import_fault(fault: LegacyImportFault) -> bool {
 #[derive(Debug, Clone)]
 pub(crate) struct RecoveryDb {
     path: PathBuf,
+    directory: PathBuf,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -331,56 +339,240 @@ fn err(error: rusqlite::Error) -> String {
     format!("Recovery database error: {error}")
 }
 
+const RECOVERY_DIRECTORY: &str = "recovery-v2";
+const DATABASE_FILE: &str = "recovery.sqlite3";
+const SQLITE_SIDECARS: &[&str] = &[
+    "recovery.sqlite3-wal",
+    "recovery.sqlite3-shm",
+    "recovery.sqlite3-journal",
+];
+
 #[cfg(unix)]
-fn owner_private(path: &Path, directory: bool) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-        || (directory && !metadata.is_dir())
-        || (!directory && !metadata.is_file())
-    {
-        return Err("Recovery database storage is not owner-private".into());
+fn os_name(name: &str) -> Result<CString, String> {
+    CString::new(name).map_err(|_| "Recovery database storage name is invalid".to_string())
+}
+
+#[cfg(unix)]
+fn openat_file(
+    directory: &fs::File,
+    name: &OsStr,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> io::Result<fs::File> {
+    let name =
+        CString::new(name.as_bytes()).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
     }
-    if !directory && metadata.nlink() != 1 {
-        return Err("Recovery database file has unexpected links".into());
+    Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn verify_owned_directory(directory: &fs::File, label: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("Could not inspect {label}: {error}"))?;
+    if !metadata.is_dir() {
+        return Err(format!("{label} must be a directory"));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!("{label} is not owned by the effective user"));
+    }
+    let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
+    if result != 0 {
+        return Err(format!(
+            "Could not harden {label} to 0700: {}",
+            io::Error::last_os_error()
+        ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn verify_owned_file(file: &fs::File, label: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Could not inspect {label}: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!("{label} is not owned by the effective user"));
+    }
+    if metadata.nlink() != 1 {
+        return Err(format!("{label} has unexpected links"));
+    }
+    let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+    if result != 0 {
+        return Err(format!(
+            "Could not harden {label} to 0600: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_parent_directory<'a>(path: &'a Path, label: &str) -> Result<(fs::File, &'a OsStr), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} has no parent directory"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{label} has no final component"))?;
+    let parent = fs::File::open(parent)
+        .map_err(|error| format!("Could not open parent of {label}: {error}"))?;
+    Ok((parent, name))
+}
+
+#[cfg(unix)]
+fn open_or_create_private_directory(
+    parent: &fs::File,
+    name: &OsStr,
+    label: &str,
+) -> Result<fs::File, String> {
+    match openat_file(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+        Ok(directory) => {
+            verify_owned_directory(&directory, label)?;
+            Ok(directory)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let name_c =
+                CString::new(name.as_bytes()).map_err(|_| format!("{label} name is invalid"))?;
+            let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) };
+            if created != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+                return Err(format!(
+                    "Could not create {label}: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            let directory = openat_file(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+                .map_err(|open_error| format!("Could not safely open {label}: {open_error}"))?;
+            verify_owned_directory(&directory, label)?;
+            Ok(directory)
+        }
+        Err(error) => Err(format!(
+            "Could not safely open {label} without following links: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn open_or_create_private_file(
+    parent: &fs::File,
+    name: &str,
+    label: &str,
+) -> Result<fs::File, String> {
+    let name = os_name(name)?;
+    match openat_file(
+        parent,
+        OsStr::new(name.to_str().expect("valid static name")),
+        libc::O_RDONLY,
+        0,
+    ) {
+        Ok(file) => {
+            verify_owned_file(&file, label)?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let descriptor = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+            if descriptor < 0 {
+                return Err(format!(
+                    "Could not create {label}: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            let file = unsafe { fs::File::from_raw_fd(descriptor) };
+            verify_owned_file(&file, label)?;
+            Ok(file)
+        }
+        Err(error) => Err(format!(
+            "Could not safely open {label} without following links: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn harden_existing_private_file(parent: &fs::File, name: &str, label: &str) -> Result<(), String> {
+    let name = os_name(name)?;
+    match openat_file(
+        parent,
+        OsStr::new(name.to_str().expect("valid static name")),
+        libc::O_RDONLY,
+        0,
+    ) {
+        Ok(file) => verify_owned_file(&file, label),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not safely open {label} without following links: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn prepare_private_storage(config_root: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let (parent, config_name) =
+        open_parent_directory(config_root, "AMTE application config directory")?;
+    let config = open_or_create_private_directory(
+        &parent,
+        config_name,
+        "AMTE application config directory",
+    )?;
+    let recovery = open_or_create_private_directory(
+        &config,
+        OsStr::new(RECOVERY_DIRECTORY),
+        "AMTE recovery-v2 directory",
+    )?;
+    let database =
+        open_or_create_private_file(&recovery, DATABASE_FILE, "AMTE recovery SQLite database")?;
+    drop(database);
+    let directory = config_root.join(RECOVERY_DIRECTORY);
+    Ok((directory.join(DATABASE_FILE), directory))
 }
 
 #[cfg(not(unix))]
-fn owner_private(_path: &Path, _directory: bool) -> Result<(), String> {
-    Ok(())
-}
-
-fn create_private_dir(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        return owner_private(path, true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(path).map_err(|e| e.to_string())?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(path).map_err(|e| e.to_string())?;
-    owner_private(path, true)
+fn prepare_private_storage(config_root: &Path) -> Result<(PathBuf, PathBuf), String> {
+    fs::create_dir_all(config_root).map_err(|error| error.to_string())?;
+    let directory = config_root.join(RECOVERY_DIRECTORY);
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join(DATABASE_FILE);
+    Ok((path, directory))
 }
 
 impl RecoveryDb {
     /// `config_root` comes solely from Tauri's app config directory.
     pub(crate) fn for_config(config_root: &Path) -> Result<Self, String> {
-        create_private_dir(config_root)?;
-        let directory = config_root.join("recovery-v2");
-        create_private_dir(&directory)?;
-        let path = directory.join("recovery.sqlite3");
-        if path.exists() {
-            owner_private(&path, false)?;
-        }
-        let db = Self { path };
+        // This may tighten only the AMTE-owned application directory and its
+        // recovery-v2 children. Generic XDG parents remain untouched. Every
+        // existing component is opened no-follow and type/owner/link-checked
+        // before its descriptor is chmodded; no recovery bytes are read here.
+        let (path, directory) = prepare_private_storage(config_root)?;
+        let db = Self { path, directory };
+        // Reject a hostile pre-existing SQLite sidecar before SQLite is allowed
+        // to resolve it. A missing sidecar is normal and is checked again after
+        // WAL mode can create one.
+        db.verify_sidecars()?;
         let connection = db.connect()?;
         db.migrate(&connection)?;
         db.verify_sidecars()?;
@@ -388,17 +580,7 @@ impl RecoveryDb {
     }
 
     fn connect(&self) -> Result<Connection, String> {
-        let created = !self.path.exists();
         let connection = Connection::open(&self.path).map_err(err)?;
-        if created {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        owner_private(&self.path, false)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(2))
             .map_err(err)?;
@@ -407,22 +589,38 @@ impl RecoveryDb {
     }
 
     fn verify_sidecars(&self) -> Result<(), String> {
-        for suffix in ["-wal", "-shm"] {
-            let path = PathBuf::from(format!("{}{}", self.path.display(), suffix));
-            if path.exists() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = fs::symlink_metadata(&path)
-                        .map_err(|e| e.to_string())?
-                        .permissions()
-                        .mode();
-                    if mode & 0o077 != 0 {
-                        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-                owner_private(&path, false)?;
+        #[cfg(unix)]
+        {
+            let config_root = self
+                .directory
+                .parent()
+                .ok_or_else(|| "AMTE recovery-v2 directory has no config parent".to_string())?;
+            let (xdg_parent, config_name) =
+                open_parent_directory(config_root, "AMTE application config directory")?;
+            let config = open_or_create_private_directory(
+                &xdg_parent,
+                config_name,
+                "AMTE application config directory",
+            )?;
+            let directory = open_or_create_private_directory(
+                &config,
+                OsStr::new(RECOVERY_DIRECTORY),
+                "AMTE recovery-v2 directory",
+            )?;
+            harden_existing_private_file(
+                &directory,
+                DATABASE_FILE,
+                "AMTE recovery SQLite database",
+            )?;
+            // SQLite may create or remove sidecars between transactions. A
+            // missing sidecar is normal; every existing one is reopened
+            // no-follow and hardened through its descriptor before use.
+            for name in SQLITE_SIDECARS {
+                harden_existing_private_file(
+                    &directory,
+                    name,
+                    &format!("AMTE SQLite sidecar {name}"),
+                )?;
             }
         }
         Ok(())
@@ -2211,6 +2409,12 @@ impl RecoveryDb {
     #[cfg(test)]
     pub(crate) fn test_path(&self) -> PathBuf {
         self.path.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn harden_storage_components_for_test(config_root: &Path) -> Result<(), String> {
+        let (path, directory) = prepare_private_storage(config_root)?;
+        Self { path, directory }.verify_sidecars()
     }
 
     #[cfg(test)]
